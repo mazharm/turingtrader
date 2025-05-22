@@ -1,0 +1,529 @@
+"""
+Risk management module for the TuringTrader algorithm.
+Controls position sizing, risk limits, and monitors overall portfolio risk.
+"""
+
+import logging
+from datetime import datetime, time, timedelta
+from typing import Dict, List, Optional, Tuple, Union
+
+from .config import Config, RiskParameters
+
+
+class RiskManager:
+    """
+    Risk manager for the trading algorithm.
+    Handles position sizing, maximum risk, and other risk controls.
+    """
+    
+    def __init__(self, config: Optional[Config] = None):
+        """
+        Initialize the risk manager.
+        
+        Args:
+            config: Configuration object
+        """
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize configuration
+        self.config = config or Config()
+        self.risk_params = self.config.risk
+        
+        # Internal state
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+        self.max_drawdown = 0.0
+        self.starting_balance = 0.0
+        self.current_positions = {}
+        self._position_history = []
+        
+        # Initialize risk limits
+        self._initialize_risk_limits()
+    
+    def _initialize_risk_limits(self) -> None:
+        """Initialize risk limits from configuration."""
+        self.max_daily_risk_amount = 0.0  # Will be set when account value is known
+        self.max_position_size = 0.0      # Will be set when account value is known
+        self.max_delta_exposure = self.risk_params.max_delta_exposure
+        self.stop_loss_pct = self.risk_params.stop_loss_pct
+        self.target_profit_pct = self.risk_params.target_profit_pct
+    
+    def update_account_value(self, account_value: float) -> None:
+        """
+        Update account value and risk limits.
+        
+        Args:
+            account_value: Current account value (USD)
+        """
+        if account_value <= 0:
+            self.logger.error(f"Invalid account value: {account_value}")
+            return
+            
+        # Set starting balance if not set
+        if self.starting_balance == 0.0:
+            self.starting_balance = account_value
+            
+        # Update risk limits based on account value
+        self.max_daily_risk_amount = account_value * (self.risk_params.max_daily_risk_pct / 100.0)
+        self.max_position_size = account_value * (self.risk_params.max_position_size_pct / 100.0)
+        
+        # Update maximum drawdown
+        current_drawdown = (1.0 - (account_value / self.starting_balance)) * 100.0
+        if current_drawdown > self.max_drawdown:
+            self.max_drawdown = current_drawdown
+            
+        self.logger.info(f"Updated account value: ${account_value:.2f}, "
+                       f"max position: ${self.max_position_size:.2f}, "
+                       f"max daily risk: ${self.max_daily_risk_amount:.2f}")
+    
+    def update_risk_level(self, level: int) -> None:
+        """
+        Update the risk level.
+        
+        Args:
+            level: Risk level (1-10)
+        """
+        self.risk_params.adjust_for_risk_level(level)
+        self._initialize_risk_limits()
+        self.logger.info(f"Updated risk level to {level}")
+    
+    def calculate_position_size(self, 
+                              price: float, 
+                              volatility: float, 
+                              account_value: float,
+                              vol_multiplier: float = 1.0) -> int:
+        """
+        Calculate position size based on price, volatility, and account value.
+        
+        Args:
+            price: Price of the instrument
+            volatility: Current volatility (percentage)
+            account_value: Current account value (USD)
+            vol_multiplier: Multiplier based on volatility analysis
+            
+        Returns:
+            int: Number of contracts/shares to trade
+        """
+        if price <= 0 or account_value <= 0:
+            return 0
+            
+        # Update account value and limits if needed
+        if self.max_daily_risk_amount == 0.0:
+            self.update_account_value(account_value)
+            
+        # Base position size as percentage of max position size
+        base_size = self.max_position_size * vol_multiplier
+        
+        # Adjust for volatility - reduce position size in extreme volatility
+        if volatility > 40:
+            vol_factor = 0.6
+        elif volatility > 30:
+            vol_factor = 0.8
+        elif volatility > 20:
+            vol_factor = 1.0
+        else:
+            vol_factor = 0.7  # Lower position size in low volatility
+            
+        # Calculate dollar amount
+        position_value = base_size * vol_factor
+        
+        # Convert to quantity
+        quantity = int(position_value / price)
+        
+        self.logger.info(f"Calculated position size: {quantity} units "
+                       f"(${position_value:.2f}, {vol_multiplier:.2f} vol mult, "
+                       f"{vol_factor:.2f} vol factor)")
+                       
+        return max(1, quantity)  # Ensure at least 1 unit
+    
+    def calculate_option_quantity(self, 
+                                option_price: float,
+                                delta: float,
+                                account_value: float,
+                                vol_multiplier: float = 1.0) -> int:
+        """
+        Calculate option quantity based on price, delta, and account value.
+        
+        Args:
+            option_price: Price of the option contract
+            delta: Option delta (absolute value)
+            account_value: Current account value (USD)
+            vol_multiplier: Multiplier based on volatility analysis
+            
+        Returns:
+            int: Number of option contracts to trade
+        """
+        if option_price <= 0 or account_value <= 0:
+            return 0
+            
+        # Ensure delta is positive for calculation
+        abs_delta = abs(delta)
+        
+        # Update account value and limits if needed
+        if self.max_daily_risk_amount == 0.0:
+            self.update_account_value(account_value)
+            
+        # Base position value as percentage of max position size
+        base_size = self.max_position_size * vol_multiplier
+        
+        # Adjust for delta exposure
+        # Higher delta = fewer contracts to stay within delta exposure limits
+        if abs_delta > 0.01:  # Avoid division by very small deltas
+            delta_factor = min(1.0, self.max_delta_exposure / (100 * abs_delta))
+        else:
+            delta_factor = 0.5  # Default for very low delta
+            
+        # Calculate dollar amount
+        position_value = base_size * delta_factor
+        
+        # Options have multiplier (usually 100)
+        contract_value = option_price * 100
+        
+        # Calculate number of contracts
+        if contract_value > 0:
+            quantity = int(position_value / contract_value)
+        else:
+            quantity = 0
+            
+        self.logger.info(f"Calculated option quantity: {quantity} contracts "
+                       f"(${position_value:.2f}, delta: {abs_delta:.2f}, "
+                       f"contract value: ${contract_value:.2f})")
+                       
+        return max(1, quantity)  # Ensure at least 1 contract
+    
+    def update_daily_pnl(self, trade_pnl: float) -> bool:
+        """
+        Update daily P&L and check if daily risk limit is exceeded.
+        
+        Args:
+            trade_pnl: P&L from the latest trade (positive or negative)
+            
+        Returns:
+            bool: True if still within daily risk limit, False otherwise
+        """
+        self.daily_pnl += trade_pnl
+        self.daily_trades += 1
+        
+        # Check if we've exceeded max daily loss
+        if self.daily_pnl < -self.max_daily_risk_amount:
+            self.logger.warning(f"Daily risk limit exceeded: ${self.daily_pnl:.2f} loss "
+                             f"exceeds ${self.max_daily_risk_amount:.2f} limit")
+            return False
+            
+        return True
+    
+    def reset_daily_metrics(self) -> None:
+        """Reset daily metrics for a new trading day."""
+        self.logger.info(f"Resetting daily metrics. Previous P&L: ${self.daily_pnl:.2f}, "
+                       f"trades: {self.daily_trades}")
+                       
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+    
+    def add_position(self, symbol: str, quantity: int, entry_price: float, 
+                   position_type: str = 'option', option_data: Optional[Dict] = None) -> None:
+        """
+        Add a new position to tracking.
+        
+        Args:
+            symbol: Symbol or identifier
+            quantity: Number of shares/contracts
+            entry_price: Entry price per share/contract
+            position_type: Type of position ('stock' or 'option')
+            option_data: Additional option details (for options)
+        """
+        if symbol in self.current_positions:
+            self.logger.warning(f"Position already exists for {symbol}, updating")
+            
+        position = {
+            'symbol': symbol,
+            'quantity': quantity,
+            'entry_price': entry_price,
+            'current_price': entry_price,
+            'type': position_type,
+            'entry_time': datetime.now(),
+            'pnl': 0.0,
+            'pnl_pct': 0.0,
+            'stop_loss': entry_price * (1 - self.stop_loss_pct/100) if position_type == 'long' else 
+                         entry_price * (1 + self.stop_loss_pct/100),
+            'take_profit': entry_price * (1 + self.target_profit_pct/100) if position_type == 'long' else
+                          entry_price * (1 - self.target_profit_pct/100)
+        }
+        
+        if option_data:
+            position.update(option_data)
+            
+        self.current_positions[symbol] = position
+        self._position_history.append({
+            'action': 'open',
+            'time': datetime.now(),
+            'position': position.copy()
+        })
+        
+        self.logger.info(f"Added position: {quantity} {symbol} @ ${entry_price:.2f}")
+    
+    def update_position(self, symbol: str, current_price: float) -> Dict:
+        """
+        Update a position with current price and P&L.
+        
+        Args:
+            symbol: Symbol or identifier
+            current_price: Current market price
+            
+        Returns:
+            Dict with position info and status
+        """
+        if symbol not in self.current_positions:
+            self.logger.warning(f"No position found for {symbol}")
+            return {'symbol': symbol, 'status': 'not_found'}
+            
+        position = self.current_positions[symbol]
+        position['current_price'] = current_price
+        
+        entry_price = position['entry_price']
+        quantity = position['quantity']
+        
+        # Calculate P&L
+        if position['type'] == 'option':
+            # Option contracts typically have multiplier of 100
+            position['pnl'] = (current_price - entry_price) * quantity * 100
+        else:
+            position['pnl'] = (current_price - entry_price) * quantity
+            
+        # Calculate percentage P&L
+        if entry_price > 0:
+            position['pnl_pct'] = ((current_price / entry_price) - 1.0) * 100
+            
+        # Determine status based on stop loss and take profit
+        status = 'open'
+        
+        # For long positions
+        if position.get('position_type', 'long') == 'long':
+            if current_price <= position['stop_loss']:
+                status = 'stop_loss'
+            elif current_price >= position['take_profit']:
+                status = 'take_profit'
+        # For short positions
+        else:
+            if current_price >= position['stop_loss']:
+                status = 'stop_loss'
+            elif current_price <= position['take_profit']:
+                status = 'take_profit'
+                
+        # Update status
+        position['status'] = status
+        
+        return {'symbol': symbol, 'position': position, 'status': status}
+    
+    def close_position(self, symbol: str, exit_price: float) -> Dict:
+        """
+        Close a position and calculate final P&L.
+        
+        Args:
+            symbol: Symbol or identifier
+            exit_price: Exit price per share/contract
+            
+        Returns:
+            Dict with position details and final P&L
+        """
+        if symbol not in self.current_positions:
+            self.logger.warning(f"No position found for {symbol}")
+            return {'symbol': symbol, 'status': 'not_found', 'pnl': 0.0}
+            
+        position = self.current_positions[symbol]
+        entry_price = position['entry_price']
+        quantity = position['quantity']
+        
+        # Calculate final P&L
+        if position['type'] == 'option':
+            # Option contracts typically have multiplier of 100
+            final_pnl = (exit_price - entry_price) * quantity * 100
+        else:
+            final_pnl = (exit_price - entry_price) * quantity
+            
+        # Calculate percentage P&L
+        if entry_price > 0:
+            final_pnl_pct = ((exit_price / entry_price) - 1.0) * 100
+        else:
+            final_pnl_pct = 0.0
+            
+        # Record trade completion
+        self._position_history.append({
+            'action': 'close',
+            'time': datetime.now(),
+            'symbol': symbol,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'quantity': quantity,
+            'pnl': final_pnl,
+            'pnl_pct': final_pnl_pct
+        })
+        
+        # Update daily P&L
+        self.update_daily_pnl(final_pnl)
+        
+        # Remove from current positions
+        position_copy = position.copy()
+        del self.current_positions[symbol]
+        
+        self.logger.info(f"Closed position: {quantity} {symbol} @ ${exit_price:.2f}, "
+                       f"P&L: ${final_pnl:.2f} ({final_pnl_pct:.2f}%)")
+                       
+        return {
+            'symbol': symbol,
+            'position': position_copy,
+            'exit_price': exit_price,
+            'pnl': final_pnl,
+            'pnl_pct': final_pnl_pct
+        }
+    
+    def close_all_positions(self, market_data: Dict[str, float]) -> List[Dict]:
+        """
+        Close all open positions at current market prices.
+        
+        Args:
+            market_data: Dictionary of current prices by symbol
+            
+        Returns:
+            List of closed position details
+        """
+        results = []
+        
+        if not self.current_positions:
+            self.logger.info("No positions to close")
+            return results
+            
+        self.logger.info(f"Closing all positions: {len(self.current_positions)}")
+        
+        # Make a copy of keys since we'll modify the dictionary during iteration
+        for symbol in list(self.current_positions.keys()):
+            exit_price = market_data.get(symbol)
+            
+            if exit_price is None:
+                self.logger.warning(f"No market data for {symbol}, using last known price")
+                position = self.current_positions[symbol]
+                exit_price = position.get('current_price', position['entry_price'])
+                
+            result = self.close_position(symbol, exit_price)
+            results.append(result)
+            
+        return results
+    
+    def get_open_positions(self) -> Dict[str, Dict]:
+        """
+        Get all currently open positions.
+        
+        Returns:
+            Dictionary of open positions
+        """
+        return self.current_positions
+    
+    def get_position_history(self) -> List[Dict]:
+        """
+        Get position history.
+        
+        Returns:
+            List of historical position actions
+        """
+        return self._position_history
+    
+    def get_portfolio_stats(self) -> Dict:
+        """
+        Get portfolio statistics.
+        
+        Returns:
+            Dictionary with portfolio stats
+        """
+        total_pnl = sum(p['pnl'] for p in self._position_history if 'action' in p and p['action'] == 'close')
+        trade_count = sum(1 for p in self._position_history if 'action' in p and p['action'] == 'close')
+        
+        winning_trades = sum(1 for p in self._position_history 
+                            if 'action' in p and p['action'] == 'close' and p.get('pnl', 0) > 0)
+                            
+        losing_trades = sum(1 for p in self._position_history 
+                           if 'action' in p and p['action'] == 'close' and p.get('pnl', 0) <= 0)
+        
+        win_rate = (winning_trades / trade_count) * 100 if trade_count > 0 else 0
+        
+        return {
+            'total_pnl': total_pnl,
+            'trade_count': trade_count,
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'win_rate': win_rate,
+            'max_drawdown': self.max_drawdown
+        }
+    
+    def should_close_for_day(self, current_time: datetime = None) -> bool:
+        """
+        Determine if we should close all positions for the day.
+        
+        Args:
+            current_time: Current datetime (uses system time if None)
+            
+        Returns:
+            bool: True if we should close all positions
+        """
+        if current_time is None:
+            current_time = datetime.now()
+            
+        # Get configured end time offset
+        end_offset_hours = self.config.trading.day_end_offset_hours
+        
+        # Determine market close time (assuming 4:00 PM Eastern)
+        market_close = time(16, 0)
+        
+        # Calculate cutoff time
+        cutoff_minutes = int(end_offset_hours * 60)
+        cutoff_time = time(
+            (market_close.hour - cutoff_minutes // 60) % 24,
+            (market_close.minute - cutoff_minutes % 60) % 60
+        )
+        
+        # Check if current time is past cutoff
+        return current_time.time() >= cutoff_time
+
+
+if __name__ == "__main__":
+    # Test risk manager
+    logging.basicConfig(level=logging.INFO)
+    
+    config = Config()
+    config.risk.adjust_for_risk_level(5)  # Medium risk
+    
+    risk_manager = RiskManager(config)
+    
+    # Test position sizing
+    account_value = 100000
+    risk_manager.update_account_value(account_value)
+    
+    # Test stock position sizing
+    stock_price = 150.0
+    volatility = 25.0
+    vol_mult = 0.8
+    
+    stock_quantity = risk_manager.calculate_position_size(stock_price, volatility, account_value, vol_mult)
+    print(f"Stock position size: {stock_quantity} shares")
+    
+    # Test option position sizing
+    option_price = 3.50
+    delta = 0.45
+    
+    option_quantity = risk_manager.calculate_option_quantity(option_price, delta, account_value, vol_mult)
+    print(f"Option position size: {option_quantity} contracts")
+    
+    # Test position tracking
+    risk_manager.add_position("SPY", stock_quantity, stock_price, "stock")
+    risk_manager.add_position("SPY_CALL", option_quantity, option_price, "option", 
+                            {"delta": delta, "expiry": "20221216"})
+    
+    # Update positions
+    risk_manager.update_position("SPY", 153.0)
+    risk_manager.update_position("SPY_CALL", 4.25)
+    
+    # Close positions
+    risk_manager.close_position("SPY", 155.0)
+    risk_manager.close_position("SPY_CALL", 5.0)
+    
+    # Show stats
+    print("Portfolio stats:", risk_manager.get_portfolio_stats())

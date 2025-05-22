@@ -1,0 +1,28 @@
+[IBKR]
+# Interactive Brokers connection settings
+host = 127.0.0.1
+# 7497 for paper trading, 7496 for live
+port = 7497
+client_id = 1
+timeout = 60
+read_only = False
+
+[Risk]
+# Risk parameters (1-10, where 10 is highest risk)
+risk_level = 5
+# Uncomment to override auto-adjusted parameters
+# max_daily_risk_pct = 2.0
+# min_volatility_threshold = 15.0
+# max_position_size_pct = 20.0
+# max_delta_exposure = 50.0
+
+[Trading]
+# Trading symbols and parameters
+index_symbol = SPY
+options_only = True
+trading_period_minutes = 15
+# Start trading this many hours after market open
+day_start_offset_hours = 0.5
+# Stop trading this many hours before market close
+day_end_offset_hours = 0.5
+default_order_type = MKT
