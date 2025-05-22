@@ -1,0 +1,21 @@
+# Interactive Brokers API
+ibapi>=9.76.1
+
+# Data analysis and visualization
+numpy>=1.19.0
+pandas>=1.0.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+# Volatility calculations
+scipy>=1.5.0
+yfinance>=0.1.63
+
+# Testing
+pytest>=6.2.0
+pytest-mock>=3.5.0
+
+# Utilities
+python-dotenv>=0.15.0
+requests>=2.25.0
+loguru>=0.5.0
