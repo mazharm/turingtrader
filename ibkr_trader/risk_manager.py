@@ -226,32 +226,56 @@ class RiskManager:
         Add a new position to tracking.
         
         Args:
-            symbol: Symbol or identifier
-            quantity: Number of shares/contracts
-            entry_price: Entry price per share/contract
-            position_type: Type of position ('stock' or 'option')
-            option_data: Additional option details (for options)
+            symbol: Symbol or identifier (e.g., SPY_C_20231215_450 or SPY_IC_20231215_430P_440P_460C_470C)
+            quantity: Number of shares/contracts/spreads
+            entry_price: Entry price per share/contract. For spreads, this is the net credit or debit.
+                         Positive for credits (e.g., Iron Condor sold), negative for debits.
+            position_type: Type of position ('stock', 'option', 'iron_condor', 'spread', etc.)
+            option_data: Additional details (e.g., legs for spreads, delta, contract object)
         """
         if symbol in self.current_positions:
-            self.logger.warning(f"Position already exists for {symbol}, updating")
+            # Handle existing position (e.g., averaging down, partial close then re-open)
+            # For simplicity, current implementation overwrites, which might not be ideal for all scenarios.
+            self.logger.warning(f"Position already exists for {symbol}, overwriting with new details.")
             
         position = {
             'symbol': symbol,
             'quantity': quantity,
-            'entry_price': entry_price,
-            'current_price': entry_price,
+            'entry_price': entry_price, # For condors, this is net credit (positive)
+            'current_price': entry_price, # Will be updated with current market value of the spread
             'type': position_type,
             'entry_time': datetime.now(),
             'pnl': 0.0,
             'pnl_pct': 0.0,
-            'stop_loss': entry_price * (1 - self.stop_loss_pct/100) if position_type == 'long' else 
-                         entry_price * (1 + self.stop_loss_pct/100),
-            'take_profit': entry_price * (1 + self.target_profit_pct/100) if position_type == 'long' else
-                          entry_price * (1 - self.target_profit_pct/100)
+            'option_data': option_data or {}
         }
-        
-        if option_data:
-            position.update(option_data)
+
+        # Specific handling for Iron Condors and other spreads for SL/TP
+        if position_type == 'iron_condor':
+            # For a credit spread like an Iron Condor, P&L is (entry_credit - current_cost_to_close) * quantity * 100
+            # Stop loss could be when current_cost_to_close reaches X * entry_credit (e.g., SL if debit to close is 2x credit received)
+            # Or, when underlying approaches short strikes.
+            # Target profit is when current_cost_to_close is Y% of entry_credit (e.g., TP if debit to close is 0.2 * credit received)
+            max_risk_per_spread = option_data.get('max_risk_per_spread', 0)
+            net_credit_received = entry_price # Should be positive
+
+            if max_risk_per_spread > 0 and net_credit_received > 0:
+                # Stop loss: e.g., if loss reaches 50% of max possible loss beyond credit received
+                # Or, if the debit to close the position exceeds a multiple of the credit received.
+                # Example: Stop if debit to close = 2 * credit_received (loss = credit_received)
+                position['stop_loss_value'] = net_credit_received - (max_risk_per_spread * (self.risk_params.condor_stop_loss_factor_of_max_risk / 100.0))
+                # Target profit: e.g., capture 50% of the initial credit
+                position['take_profit_value'] = net_credit_received * (1 - self.risk_params.condor_profit_target_factor_of_credit / 100.0)
+            else:
+                self.logger.warning(f"Max risk or net credit not properly defined for Iron Condor {symbol}, SL/TP may not be effective.")
+                position['stop_loss_value'] = None
+                position['take_profit_value'] = None
+        else: # For single options or other types
+            # Stop loss and take profit for long positions (buying options)
+            if entry_price > 0: # Assuming long option if entry_price is positive cost
+                position['stop_loss'] = entry_price * (1 - self.stop_loss_pct/100) 
+                position['take_profit'] = entry_price * (1 + self.target_profit_pct/100)
+            # Add logic for short single options if applicable (negative entry_price for credit)
             
         self.current_positions[symbol] = position
         self._position_history.append({
@@ -260,59 +284,83 @@ class RiskManager:
             'position': position.copy()
         })
         
-        self.logger.info(f"Added position: {quantity} {symbol} @ ${entry_price:.2f}")
+        self.logger.info(f"Added position: {quantity} {symbol} @ {entry_price:.2f} ({position_type})")
     
-    def update_position(self, symbol: str, current_price: float) -> Dict:
+    def update_position(self, symbol: str, current_market_value: float) -> Dict:
         """
-        Update a position with current price and P&L.
+        Update a position with its current market value and P&L.
         
         Args:
             symbol: Symbol or identifier
-            current_price: Current market price
+            current_market_value: Current market value of the position.
+                                  For options, this is the option price.
+                                  For spreads like Iron Condors, this is the current cost to close (debit) or credit if market moved favorably.
+                                  A positive value means it costs that much to buy back/close.
+                                  A negative value means you would receive that much credit to close (unlikely for a condor initially sold for credit).
             
         Returns:
             Dict with position info and status
         """
         if symbol not in self.current_positions:
-            self.logger.warning(f"No position found for {symbol}")
+            self.logger.warning(f"No position found for {symbol} to update.")
             return {'symbol': symbol, 'status': 'not_found'}
             
         position = self.current_positions[symbol]
-        position['current_price'] = current_price
+        position['current_price'] = current_market_value # This is the current value/cost_to_close of the spread/option
         
         entry_price = position['entry_price']
         quantity = position['quantity']
+        position_type = position['type']
         
         # Calculate P&L
-        if position['type'] == 'option':
-            # Option contracts typically have multiplier of 100
-            position['pnl'] = (current_price - entry_price) * quantity * 100
-        else:
-            position['pnl'] = (current_price - entry_price) * quantity
-            
-        # Calculate percentage P&L
-        if entry_price > 0:
-            position['pnl_pct'] = ((current_price / entry_price) - 1.0) * 100
+        if position_type == 'iron_condor':
+            # Entry price was net credit (positive). Current market value is cost to close (debit, positive).
+            # P&L = (Credit Received - Debit to Close) * Quantity * Multiplier (usually 100 for options)
+            # If current_market_value is the debit to close one spread:
+            position['pnl'] = (entry_price - current_market_value) * quantity * 100 
+            initial_investment_basis = entry_price * quantity * 100 # The credit received
+            if initial_investment_basis != 0:
+                 # P&L % relative to initial credit. Can be > 100% if it becomes a large loss.
+                position['pnl_pct'] = (position['pnl'] / abs(initial_investment_basis)) * 100 
+            else:
+                position['pnl_pct'] = 0
+        elif position_type == 'option':
+            # Assumes long option (bought, entry_price is cost)
+            # P&L = (Current Price - Entry Price) * Quantity * Multiplier
+            position['pnl'] = (current_market_value - entry_price) * quantity * 100
+            initial_cost = entry_price * quantity * 100
+            if initial_cost != 0:
+                position['pnl_pct'] = (position['pnl'] / initial_cost) * 100
+            else:
+                position['pnl_pct'] = 0
+        else: # Simple stock-like P&L
+            position['pnl'] = (current_market_value - entry_price) * quantity
+            if entry_price != 0:
+                position['pnl_pct'] = ((current_market_value / entry_price) - 1.0) * 100
+            else:
+                position['pnl_pct'] = 0
             
         # Determine status based on stop loss and take profit
         status = 'open'
-        
-        # For long positions
-        if position.get('position_type', 'long') == 'long':
-            if current_price <= position['stop_loss']:
+        if position_type == 'iron_condor':
+            stop_loss_val = position.get('stop_loss_value')
+            take_profit_val = position.get('take_profit_value')
+            # current_market_value is the debit to close. 
+            # If debit_to_close >= stop_loss_val (e.g. stop_loss_val is a higher debit or smaller credit than entry)
+            # If debit_to_close <= take_profit_val (e.g. take_profit_val is a smaller debit, meaning profit taken)
+            if stop_loss_val is not None and current_market_value >= stop_loss_val: # Cost to close is too high
                 status = 'stop_loss'
-            elif current_price >= position['take_profit']:
+            elif take_profit_val is not None and current_market_value <= take_profit_val: # Cost to close is favorably low
                 status = 'take_profit'
-        # For short positions
-        else:
-            if current_price >= position['stop_loss']:
+        elif position_type == 'option': # Assuming long option
+            if current_market_value <= position.get('stop_loss', float('-inf')):
                 status = 'stop_loss'
-            elif current_price <= position['take_profit']:
+            elif current_market_value >= position.get('take_profit', float('inf')):
                 status = 'take_profit'
+        # Add other types if necessary
                 
-        # Update status
         position['status'] = status
-        
+        self.logger.debug(f"Updated position {symbol}: P&L ${position['pnl']:.2f} ({position['pnl_pct']:.2f}%), Status: {status}")
         return {'symbol': symbol, 'position': position, 'status': status}
     
     def close_position(self, symbol: str, exit_price: float) -> Dict:
@@ -321,31 +369,41 @@ class RiskManager:
         
         Args:
             symbol: Symbol or identifier
-            exit_price: Exit price per share/contract
-            
+            exit_price: Exit price per share/contract. For spreads, this is the net debit paid or credit received to close.
+                        For an Iron Condor sold for credit, exit_price is the debit paid to close.
         Returns:
             Dict with position details and final P&L
         """
         if symbol not in self.current_positions:
-            self.logger.warning(f"No position found for {symbol}")
+            self.logger.warning(f"No position found for {symbol} to close.")
             return {'symbol': symbol, 'status': 'not_found', 'pnl': 0.0}
             
-        position = self.current_positions[symbol]
+        position = self.current_positions.pop(symbol) # Remove from current positions
         entry_price = position['entry_price']
         quantity = position['quantity']
+        position_type = position['type']
         
-        # Calculate final P&L
-        if position['type'] == 'option':
-            # Option contracts typically have multiplier of 100
+        final_pnl = 0.0
+        final_pnl_pct = 0.0
+
+        if position_type == 'iron_condor':
+            # entry_price was net credit (e.g., +1.50)
+            # exit_price is net debit to close (e.g., +0.30 to buy back for profit, or +2.00 to buy back for loss)
+            # P&L = (Credit Received - Debit Paid) * Quantity * 100
+            final_pnl = (entry_price - exit_price) * quantity * 100
+            initial_investment_basis = entry_price * quantity * 100 # The credit received
+            if initial_investment_basis != 0:
+                final_pnl_pct = (final_pnl / abs(initial_investment_basis)) * 100
+        elif position_type == 'option':
+            # Assumes long option (bought, entry_price is cost)
             final_pnl = (exit_price - entry_price) * quantity * 100
+            initial_cost = entry_price * quantity * 100
+            if initial_cost != 0:
+                final_pnl_pct = (final_pnl / initial_cost) * 100
         else:
             final_pnl = (exit_price - entry_price) * quantity
-            
-        # Calculate percentage P&L
-        if entry_price > 0:
-            final_pnl_pct = ((exit_price / entry_price) - 1.0) * 100
-        else:
-            final_pnl_pct = 0.0
+            if entry_price != 0:
+                final_pnl_pct = ((exit_price / entry_price) - 1.0) * 100
             
         # Record trade completion
         self._position_history.append({
@@ -356,22 +414,20 @@ class RiskManager:
             'exit_price': exit_price,
             'quantity': quantity,
             'pnl': final_pnl,
-            'pnl_pct': final_pnl_pct
+            'pnl_pct': final_pnl_pct,
+            'position_type': position_type,
+            'option_data': position.get('option_data')
         })
         
         # Update daily P&L
         self.update_daily_pnl(final_pnl)
         
-        # Remove from current positions
-        position_copy = position.copy()
-        del self.current_positions[symbol]
-        
-        self.logger.info(f"Closed position: {quantity} {symbol} @ ${exit_price:.2f}, "
-                       f"P&L: ${final_pnl:.2f} ({final_pnl_pct:.2f}%)")
+        self.logger.info(f"Closed position: {quantity} {symbol} @ exit {exit_price:.2f}, "
+                       f"Entry: {entry_price:.2f}, P&L: ${final_pnl:.2f} ({final_pnl_pct:.2f}%)")
                        
         return {
             'symbol': symbol,
-            'position': position_copy,
+            'position_details': position, # The state of position before closing
             'exit_price': exit_price,
             'pnl': final_pnl,
             'pnl_pct': final_pnl_pct

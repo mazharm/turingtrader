@@ -24,93 +24,12 @@ from backtesting.backtest_engine import BacktestEngine
 from ibkr_trader.volatility_analyzer import VolatilityAnalyzer
 from ibkr_trader.options_strategy import OptionsStrategy
 from ibkr_trader.risk_manager import RiskManager
+from backtesting.mock_utils import MockDataFetcher # Added import
 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s - %(levelname)s - %(message)s')
-
-
-class MockDataFetcher:
-    """Mock data fetcher to avoid database dependencies."""
-    
-    def __init__(self):
-        """Initialize mock data fetcher."""
-        self.logger = logging.getLogger(__name__)
-    
-    def fetch_data(self, symbol, start_date, end_date):
-        """Generate mock historical price data for backtesting."""
-        # Convert dates to datetime objects
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date)
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date)
-        
-        # Generate date range
-        dates = pd.date_range(start=start_date, end=end_date, freq='B')
-        
-        # Initial price
-        if symbol == 'VIX':
-            initial_price = 20.0
-            volatility = 0.15  # Higher volatility for VIX
-        else:  # Assume SPY or other index
-            initial_price = 400.0
-            volatility = 0.01
-        
-        # Generate price series with random walk
-        np.random.seed(42)  # For reproducibility
-        
-        # Add some realistic market behavior
-        # For SPY - generally upward trend with periodic drawdowns
-        # For VIX - mean reverting with spikes
-        
-        prices = [initial_price]
-        for i in range(1, len(dates)):
-            if symbol == 'VIX':
-                # Mean-reverting with occasional spikes
-                mean_reversion = 0.05 * (20.0 - prices[-1])
-                spike = 0.0
-                if random.random() < 0.05:  # 5% chance of spike
-                    spike = random.uniform(3.0, 10.0)
-                change = mean_reversion + spike + np.random.normal(0, volatility * prices[-1])
-            else:
-                # Trend with random noise
-                trend = 0.0002  # Slight upward bias
-                change = trend * prices[-1] + np.random.normal(0, volatility * prices[-1])
-            
-            # Ensure price doesn't go negative
-            new_price = max(0.1, prices[-1] + change)
-            prices.append(new_price)
-        
-        # Create DataFrame
-        df = pd.DataFrame({
-            'open': prices,
-            'high': [p * (1 + volatility * random.uniform(0, 1)) for p in prices],
-            'low': [p * (1 - volatility * random.uniform(0, 1)) for p in prices],
-            'close': prices,
-            'volume': [int(1e6 * random.uniform(0.5, 1.5)) for _ in prices]
-        }, index=dates)
-        
-        return df
-        
-    def fetch_vix_data(self, start_date, end_date):
-        """Fetch mock VIX data."""
-        return self.fetch_data('VIX', start_date, end_date)
-    
-    def fetch_sp500_data(self, start_date, end_date):
-        """Fetch mock S&P500 data."""
-        return self.fetch_data('SPY', start_date, end_date)
-
-
-# Patch the BacktestEngine to use our mock data fetcher
-original_init = BacktestEngine.__init__
-
-def patched_init(self, config=None, volatility_analyzer=None, risk_manager=None, 
-               options_strategy=None, initial_balance=100000.0):
-    original_init(self, config, volatility_analyzer, risk_manager, options_strategy, initial_balance)
-    self.data_fetcher = MockDataFetcher()
-
-BacktestEngine.__init__ = patched_init
 
 
 class BacktestRunner:
@@ -165,7 +84,8 @@ class BacktestRunner:
             volatility_analyzer=volatility_analyzer,
             risk_manager=risk_manager,
             options_strategy=options_strategy,
-            initial_balance=100000.0
+            initial_balance=100000.0,
+            data_fetcher=MockDataFetcher() # Inject MockDataFetcher
         )
         
         # Run backtest
@@ -259,7 +179,8 @@ class BacktestRunner:
                 volatility_analyzer=volatility_analyzer,
                 risk_manager=risk_manager,
                 options_strategy=options_strategy,
-                initial_balance=100000.0
+                initial_balance=100000.0,
+                data_fetcher=MockDataFetcher() # Inject MockDataFetcher
             )
             
             # Run backtest
@@ -525,37 +446,38 @@ class BacktestRunner:
         logging.info(f"Risk level summary saved to {summary_path}")
 
 
-def main():
-    """Main function."""
-    try:
-        # Set up output directory
-        output_dir = './reports/volatility_harvesting'
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Set test period (1 year)
-        start_date = '2022-01-01'
-        end_date = '2023-01-01'
-        
-        # Create runner
-        runner = BacktestRunner(output_dir)
-        
-        # Run parameter tests
-        logging.info("Running parameter sensitivity tests...")
-        param_results = runner.run_parameter_tests(start_date, end_date)
-        runner.generate_parameter_report(param_results)
-        
-        # Run risk level tests
-        logging.info("Running risk level tests...")
-        risk_results = runner.run_risk_level_tests(start_date, end_date)
-        runner.generate_risk_level_report(risk_results)
-        
-        logging.info("Backtesting completed successfully")
-        return 0
+def main(output_dir_base: str = './reports/volatility_harvesting_simple', 
+         start_date_str: str = '2022-01-01', 
+         end_date_str: str = '2023-01-01', 
+         run_param_tests: bool = True, 
+         run_risk_tests: bool = True):
+    """Main function to run tests and generate reports."""
     
-    except Exception as e:
-        logging.error(f"Error in backtesting: {e}", exc_info=True)
-        return 1
+    output_dir = os.path.join(output_dir_base, datetime.now().strftime('%Y%m%d_%H%M%S'))
+    os.makedirs(output_dir, exist_ok=True)
+    
+    runner = BacktestRunner(output_dir=output_dir)
+    
+    if run_param_tests:
+        logging.info("Running parameter sensitivity tests...")
+        param_results = runner.run_parameter_tests(start_date_str, end_date_str)
+        if param_results:
+            runner.generate_parameter_report(param_results)
+        else:
+            logging.warning("No results from parameter tests to report.")
+
+    if run_risk_tests:
+        logging.info("Running risk level tests...")
+        risk_results = runner.run_risk_level_tests(start_date_str, end_date_str)
+        if risk_results:
+            runner.generate_risk_level_report(risk_results)
+        else:
+            logging.warning("No results from risk level tests to report.")
+
+    logging.info(f"All tests completed. Reports in {output_dir}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Example usage, can be expanded with argparse if needed
+    main(run_param_tests=True, run_risk_tests=True)
+    sys.exit(0)

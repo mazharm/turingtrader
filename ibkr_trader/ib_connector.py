@@ -634,11 +634,12 @@ class IBConnector:
                                long_put_strike: float,
                                long_call_strike: float,
                                quantity: int,
-                               limit_price: Optional[float] = None,
-                               exchange: str = 'SMART',
+                               limit_price: Optional[float] = None, # This is the NET CREDIT desired
+                               exchange: str = 'SMART', # Default to SMART for underlying, options might use specific exchanges
                                currency: str = 'USD') -> Any:
         """
         Submit an iron condor order.
+        For an iron condor, we are typically SELLING the spread to receive a net credit.
         
         Args:
             symbol: Underlying symbol
@@ -648,8 +649,11 @@ class IBConnector:
             long_put_strike: Strike price for long put
             long_call_strike: Strike price for long call
             quantity: Number of iron condor spreads
-            limit_price: Limit price for the entire spread (credit received)
-            exchange: Exchange name
+            limit_price: Limit price for the entire spread (NET CREDIT desired). 
+                         IB requires a positive price for limit orders.
+                         This price represents the credit you want to receive per spread.
+            exchange: The exchange for the combo. BOX, CBOE, or other specific option exchanges might be better.
+                      'SMART' might not be ideal for complex option spreads. Consider 'BOX' or allowing override.
             currency: Currency code
             
         Returns:
@@ -660,59 +664,72 @@ class IBConnector:
             
         try:
             # Create iron condor contract
+            # Ensure the exchange used for leg creation is appropriate (e.g., 'BOX', 'CBOE2')
+            # Using 'SMART' for individual legs might be okay if IB can resolve them,
+            # but the BAG contract itself should ideally be routed to an options exchange.
             bag_contract = self.create_iron_condor_contract(
                 symbol, expiry, short_put_strike, short_call_strike,
-                long_put_strike, long_call_strike, exchange, currency
+                long_put_strike, long_call_strike, exchange=self.ibkr_config.default_options_exchange, currency=currency
             )
             
-            # Create order
+            # Qualify the bag contract itself
+            self.ib.qualifyContracts(bag_contract)
+
+            # Create order: To receive a credit, this must be a SELL order.
+            # The limit_price should be the positive credit amount.
             if limit_price is not None:
-                # Use limit order with specified credit
-                order = LimitOrder('BUY', quantity, limit_price)
+                if limit_price <= 0:
+                    self.logger.warning("Limit price for credit must be positive. Using abs(limit_price).")
+                order_action = 'SELL' # Selling the condor to receive credit
+                lmt_price = abs(limit_price) # IB expects positive price for limit orders
+                order = LimitOrder(order_action, quantity, lmt_price)
+                order.tif = 'GTC' # Good Till Cancelled, or consider 'DAY'
             else:
-                # Use market order
-                order = MarketOrder('BUY', quantity)
+                # Market orders for complex spreads are generally not recommended due to slippage.
+                # Consider raising an error or requiring a limit price.
+                self.logger.warning("Submitting Iron Condor as a Market Order. This is risky.")
+                order = MarketOrder('SELL', quantity) # Still SELL to establish the credit position
                 
             # Submit order
-            trade = self.submit_order(bag_contract, order)
+            trade = self.ib.placeOrder(bag_contract, order) # Use placeOrder directly
             
-            if trade:
-                self.logger.info(f"Submitted iron condor order for {symbol}, "
-                               f"Qty: {quantity}, Expiry: {expiry}, "
-                               f"Strikes: {long_put_strike}/{short_put_strike}/{short_call_strike}/{long_call_strike}")
-                
+            self.logger.info(f"Order submitted: {order.action} {order.totalQuantity} {bag_contract.symbol} Iron Condor")
+
+            # Wait for order to be acknowledged and potentially fill
+            timeout = time.time() + 10 # Increased timeout for complex orders
+            while time.time() < timeout:
+                self.ib.sleep(0.5) # ib_insync's sleep processes messages
+                if trade.isDone():
+                    break
+            
+            if trade.orderStatus.status == 'Filled':
+                self.logger.info(f"Iron Condor order filled: {trade.orderStatus.filled} @ {trade.orderStatus.avgFillPrice}")
+            elif trade.orderStatus.status == 'Submitted' or trade.orderStatus.status == 'PendingSubmit':
+                 self.logger.info(f"Iron Condor order submitted/pending, current status: {trade.orderStatus.status}")
+            else:
+                self.logger.warning(f"Iron Condor order status: {trade.orderStatus.status}, Filled: {trade.orderStatus.filled}")
+
             return trade
             
         except Exception as e:
-            self.logger.error(f"Error submitting iron condor order: {e}")
+            self.logger.error(f"Error submitting iron condor order: {e}", exc_info=True)
             return None
             
     def close_iron_condor(self,
-                        symbol: str,
-                        expiry: str,
-                        short_put_strike: float,
-                        short_call_strike: float,
-                        long_put_strike: float,
-                        long_call_strike: float,
+                        bag_contract: Bag, # Pass the qualified Bag contract of the open position
                         quantity: int,
-                        limit_price: Optional[float] = None,
-                        exchange: str = 'SMART',
-                        currency: str = 'USD') -> Any:
+                        limit_price: Optional[float] = None, # This is the NET DEBIT to pay
+                        ) -> Any:
         """
-        Close an iron condor position.
+        Close an iron condor position by submitting an opposing order.
+        To close a short iron condor (established for a credit), we BUY it back, paying a debit.
         
         Args:
-            symbol: Underlying symbol
-            expiry: Option expiry date in YYYYMMDD format
-            short_put_strike: Strike price for short put
-            short_call_strike: Strike price for short call
-            long_put_strike: Strike price for long put
-            long_call_strike: Strike price for long call
-            quantity: Number of iron condor spreads to close
-            limit_price: Limit price for closing (debit paid)
-            exchange: Exchange name
-            currency: Currency code
-            
+            bag_contract: The qualified Bag contract of the iron condor to close.
+            quantity: Number of iron condor spreads to close.
+            limit_price: Limit price for closing (NET DEBIT to pay).
+                         IB requires a positive price.
+                         
         Returns:
             Trade object if successful, None otherwise
         """
@@ -720,32 +737,39 @@ class IBConnector:
             return None
             
         try:
-            # Create iron condor contract
-            bag_contract = self.create_iron_condor_contract(
-                symbol, expiry, short_put_strike, short_call_strike,
-                long_put_strike, long_call_strike, exchange, currency
-            )
+            # Create order: To close a short condor (sold for credit), we BUY it back.
+            order_action = 'BUY' # Buying back the condor
             
-            # Create order (SELL to close a BUY position)
             if limit_price is not None:
-                # Use limit order with specified debit
-                order = LimitOrder('SELL', quantity, limit_price)
+                if limit_price <= 0:
+                    self.logger.warning("Limit price for debit must be positive. Using abs(limit_price).")
+                lmt_price = abs(limit_price) # IB expects positive price
+                order = LimitOrder(order_action, quantity, lmt_price)
+                order.tif = 'GTC'
             else:
-                # Use market order
-                order = MarketOrder('SELL', quantity)
+                self.logger.warning("Closing Iron Condor as a Market Order. This is risky.")
+                order = MarketOrder(order_action, quantity)
                 
             # Submit order
-            trade = self.submit_order(bag_contract, order)
+            trade = self.ib.placeOrder(bag_contract, order)
             
-            if trade:
-                self.logger.info(f"Submitted order to close iron condor for {symbol}, "
-                               f"Qty: {quantity}, Expiry: {expiry}, "
-                               f"Strikes: {long_put_strike}/{short_put_strike}/{short_call_strike}/{long_call_strike}")
+            self.logger.info(f"Order submitted to close Iron Condor: {order.action} {order.totalQuantity} {bag_contract.symbol}")
+
+            timeout = time.time() + 10 
+            while time.time() < timeout:
+                self.ib.sleep(0.5)
+                if trade.isDone():
+                    break
+
+            if trade.orderStatus.status == 'Filled':
+                self.logger.info(f"Iron Condor close order filled: {trade.orderStatus.filled} @ {trade.orderStatus.avgFillPrice}")
+            else:
+                self.logger.warning(f"Iron Condor close order status: {trade.orderStatus.status}, Filled: {trade.orderStatus.filled}")
                 
             return trade
             
         except Exception as e:
-            self.logger.error(f"Error closing iron condor: {e}")
+            self.logger.error(f"Error closing iron condor: {e}", exc_info=True)
             return None
 
 

@@ -24,6 +24,7 @@ from backtesting.backtest_engine import BacktestEngine
 from ibkr_trader.volatility_analyzer import VolatilityAnalyzer
 from ibkr_trader.options_strategy import OptionsStrategy
 from ibkr_trader.risk_manager import RiskManager
+from backtesting.mock_utils import MockDataFetcher # Added import
 
 
 # Configure logging
@@ -31,85 +32,7 @@ logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-class MockDataFetcher:
-    """Mock data fetcher to avoid database dependencies."""
-    
-    def __init__(self):
-        """Initialize mock data fetcher."""
-        self.logger = logging.getLogger(__name__)
-    
-    def fetch_data(self, symbol, start_date, end_date):
-        """Generate mock historical price data for backtesting."""
-        # Convert dates to datetime objects
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date)
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date)
-        
-        # Generate shorter date range - just 30 days for quick testing
-        dates = pd.date_range(start=start_date, end=start_date + timedelta(days=30), freq='B')
-        
-        # Initial price
-        if symbol == 'VIX':
-            initial_price = 20.0
-            volatility = 0.15  # Higher volatility for VIX
-        else:  # Assume SPY or other index
-            initial_price = 400.0
-            volatility = 0.01
-        
-        # Generate price series with random walk
-        np.random.seed(42)  # For reproducibility
-        
-        prices = [initial_price]
-        for i in range(1, len(dates)):
-            if symbol == 'VIX':
-                # Mean-reverting with occasional spikes
-                mean_reversion = 0.05 * (20.0 - prices[-1])
-                spike = 0.0
-                if random.random() < 0.05:  # 5% chance of spike
-                    spike = random.uniform(3.0, 10.0)
-                change = mean_reversion + spike + np.random.normal(0, volatility * prices[-1])
-            else:
-                # Trend with random noise
-                trend = 0.0002  # Slight upward bias
-                change = trend * prices[-1] + np.random.normal(0, volatility * prices[-1])
-            
-            # Ensure price doesn't go negative
-            new_price = max(0.1, prices[-1] + change)
-            prices.append(new_price)
-        
-        # Create DataFrame
-        df = pd.DataFrame({
-            'open': prices,
-            'high': [p * (1 + volatility * random.uniform(0, 1)) for p in prices],
-            'low': [p * (1 - volatility * random.uniform(0, 1)) for p in prices],
-            'close': prices,
-            'volume': [int(1e6 * random.uniform(0.5, 1.5)) for _ in prices]
-        }, index=dates)
-        
-        return df
-        
-    def fetch_vix_data(self, start_date, end_date):
-        """Fetch mock VIX data."""
-        return self.fetch_data('VIX', start_date, end_date)
-    
-    def fetch_sp500_data(self, start_date, end_date):
-        """Fetch mock S&P500 data."""
-        return self.fetch_data('SPY', start_date, end_date)
-
-
-# Patch the BacktestEngine to use our mock data fetcher
-original_init = BacktestEngine.__init__
-
-def patched_init(self, config=None, volatility_analyzer=None, risk_manager=None, 
-               options_strategy=None, initial_balance=100000.0):
-    original_init(self, config, volatility_analyzer, risk_manager, options_strategy, initial_balance)
-    self.data_fetcher = MockDataFetcher()
-
-BacktestEngine.__init__ = patched_init
-
-
-def run_backtest(config, start_date, end_date, risk_level=5):
+def run_backtest(config, start_date, end_date, risk_level=5, days_limit=None):
     """Run a backtest with the given configuration."""
     # Create components
     volatility_analyzer = VolatilityAnalyzer(config)
@@ -122,8 +45,13 @@ def run_backtest(config, start_date, end_date, risk_level=5):
         volatility_analyzer=volatility_analyzer,
         risk_manager=risk_manager,
         options_strategy=options_strategy,
-        initial_balance=100000.0
+        initial_balance=100000.0,
+        data_fetcher=MockDataFetcher() # Inject MockDataFetcher
     )
+    
+    # Modify data fetcher calls if days_limit is used by MockDataFetcher
+    # This part depends on how MockDataFetcher is modified to accept days_limit
+    # For now, assuming MockDataFetcher handles it internally or via its methods
     
     # Run backtest
     results = engine.run_backtest(
@@ -135,11 +63,12 @@ def run_backtest(config, start_date, end_date, risk_level=5):
     return results
 
 
-def run_risk_level_tests(output_dir):
+def run_risk_level_tests(output_dir, days_limit_mock_data=30):
     """Run tests for different risk levels and generate a report."""
     start_date = '2022-01-01'
-    end_date = '2022-02-01'  # Short timeframe for quick testing
-    
+    # End date is effectively determined by start_date + days_limit_mock_data in MockDataFetcher
+    end_date = (pd.to_datetime(start_date) + timedelta(days=days_limit_mock_data)).strftime('%Y-%m-%d') 
+
     results = {}
     risk_levels = [1, 3, 5, 7, 10]  # Reduced test set
     
@@ -150,8 +79,9 @@ def run_risk_level_tests(output_dir):
         config = Config()
         config.risk.adjust_for_risk_level(risk_level)
         
-        # Run backtest
-        result = run_backtest(config, start_date, end_date, risk_level)
+        # Run backtest - MockDataFetcher will use its internal days_limit logic if set
+        # Or, pass days_limit to run_backtest if that function is adapted
+        result = run_backtest(config, start_date, end_date, risk_level, days_limit=days_limit_mock_data)
         result['risk_level'] = risk_level
         results[risk_level] = result
     
@@ -205,7 +135,7 @@ def run_risk_level_tests(output_dir):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.suptitle('Risk Level Comparison for Volatility Harvesting Strategy', fontsize=16, y=1.02)
+    plt.suptitle('Risk Level Comparison for Volatility Harvesting Strategy (Mini)', fontsize=16, y=1.02)
     
     # Save plot
     os.makedirs(output_dir, exist_ok=True)
@@ -221,11 +151,12 @@ def run_risk_level_tests(output_dir):
     return results
 
 
-def run_parameter_tests(output_dir):
+def run_parameter_tests(output_dir, days_limit_mock_data=30):
     """Run tests for different strategy parameters and generate a report."""
     start_date = '2022-01-01'
-    end_date = '2022-02-01'  # Short timeframe for quick testing
-    
+    # End date is effectively determined by start_date + days_limit_mock_data
+    end_date = (pd.to_datetime(start_date) + timedelta(days=days_limit_mock_data)).strftime('%Y-%m-%d') 
+
     # Base configuration
     config = Config()
     
@@ -242,7 +173,7 @@ def run_parameter_tests(output_dir):
         logging.info(f"Testing IV/HV ratio {ratio}")
         test_config = Config()  # Fresh config
         test_config.vol_harvesting.iv_hv_ratio_threshold = ratio
-        result = run_backtest(test_config, start_date, end_date)
+        result = run_backtest(test_config, start_date, end_date, days_limit=days_limit_mock_data)
         
         results[f'iv_hv_{ratio}'] = result
         all_data.append({
@@ -259,7 +190,7 @@ def run_parameter_tests(output_dir):
         logging.info(f"Testing min IV threshold {threshold}")
         test_config = Config()  # Fresh config
         test_config.vol_harvesting.min_iv_threshold = threshold
-        result = run_backtest(test_config, start_date, end_date)
+        result = run_backtest(test_config, start_date, end_date, days_limit=days_limit_mock_data)
         
         results[f'min_iv_{threshold}'] = result
         all_data.append({
@@ -276,7 +207,7 @@ def run_parameter_tests(output_dir):
         logging.info(f"Testing strike width {width}")
         test_config = Config()  # Fresh config
         test_config.vol_harvesting.strike_width_pct = width
-        result = run_backtest(test_config, start_date, end_date)
+        result = run_backtest(test_config, start_date, end_date, days_limit=days_limit_mock_data)
         
         results[f'width_{width}'] = result
         all_data.append({
@@ -313,7 +244,7 @@ def run_parameter_tests(output_dir):
         axs[i, 1].grid(True)
     
     plt.tight_layout()
-    plt.suptitle('Parameter Sensitivity Analysis for Volatility Harvesting Strategy', fontsize=16, y=0.98)
+    plt.suptitle('Parameter Sensitivity Analysis for Volatility Harvesting Strategy (Mini)', fontsize=16, y=0.98)
     
     # Save plot
     os.makedirs(output_dir, exist_ok=True)
@@ -329,25 +260,31 @@ def run_parameter_tests(output_dir):
     return results
 
 
-def main():
+def main(quick_run: bool = True):
     """Main function."""
-    output_dir = './reports/volatility_harvesting'
+    output_dir_base = './reports/volatility_harvesting_mock'
+    # Use a timestamped subdirectory for each run to avoid overwriting results
+    output_dir = os.path.join(output_dir_base, datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    days_for_mock = 30 if quick_run else 90 # 30 days for mini/quick, 90 for a bit longer
+    title_suffix = "(Quick)" if quick_run else "(Standard Mock)"
+
     try:
-        logging.info("Running risk level tests...")
-        run_risk_level_tests(output_dir)
+        logging.info(f"Running risk level tests {title_suffix}...")
+        run_risk_level_tests(output_dir, days_limit_mock_data=days_for_mock)
         
-        logging.info("Running parameter sensitivity tests...")
-        run_parameter_tests(output_dir)
+        logging.info(f"Running parameter sensitivity tests {title_suffix}...")
+        run_parameter_tests(output_dir, days_limit_mock_data=days_for_mock)
         
-        logging.info("Testing completed successfully!")
+        logging.info(f"Mock testing completed successfully! Reports in {output_dir}")
         return 0
         
     except Exception as e:
-        logging.error(f"Error during testing: {e}", exc_info=True)
+        logging.error(f"Error during mock testing: {e}", exc_info=True)
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # sys.exit(main(quick_run=True)) # For a quick run (like original mini)
+    sys.exit(main(quick_run=False)) # For a slightly longer mock run

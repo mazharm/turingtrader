@@ -13,7 +13,6 @@ from ibkr_trader.config import Config
 from ibkr_trader.volatility_analyzer import VolatilityAnalyzer
 from ibkr_trader.risk_manager import RiskManager
 from ibkr_trader.options_strategy import OptionsStrategy
-from historical_data.data_fetcher import HistoricalDataFetcher
 
 
 class BacktestEngine:
@@ -25,7 +24,8 @@ class BacktestEngine:
         volatility_analyzer: Optional[VolatilityAnalyzer] = None,
         risk_manager: Optional[RiskManager] = None,
         options_strategy: Optional[OptionsStrategy] = None,
-        initial_balance: float = 100000.0
+        initial_balance: float = 100000.0,
+        data_fetcher: Optional[Any] = None  # Added data_fetcher argument
     ):
         """
         Initialize the backtesting engine.
@@ -36,6 +36,7 @@ class BacktestEngine:
             risk_manager: Risk manager instance
             options_strategy: Options strategy instance
             initial_balance: Initial account balance
+            data_fetcher: Data fetcher instance (e.g., HistoricalDataFetcher or MockDataFetcher)
         """
         self.logger = logging.getLogger(__name__)
         
@@ -49,8 +50,8 @@ class BacktestEngine:
             self.risk_manager
         )
         
-        # Initialize data fetcher
-        self.data_fetcher = HistoricalDataFetcher()
+        # Initialize data fetcher - allow injection
+        self.data_fetcher = data_fetcher or HistoricalDataFetcher()
         
         # Backtest state
         self.initial_balance = initial_balance

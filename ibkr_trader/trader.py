@@ -214,80 +214,174 @@ class TuringTrader:
         Returns:
             Dict with trade execution results
         """
-        if trade_decision.get('action') != 'buy':
-            self.logger.info("No trade to execute")
-            return {'executed': False, 'reason': 'no_buy_action'}
-        
-        try:
-            # Extract trade details
-            symbol = trade_decision.get('symbol')
-            expiry = trade_decision.get('expiry')
-            strike = trade_decision.get('strike')
-            option_type = trade_decision.get('option_type', 'call')
-            quantity = trade_decision.get('quantity', 1)
-            
-            # Convert option_type to IB format ('C' or 'P')
-            right = 'C' if option_type.lower() == 'call' else 'P'
-            
-            # Create option contract
-            contract = self.ib_connector.create_option_contract(
-                symbol=symbol,
-                expiry=expiry,
-                strike=strike,
-                option_type=right
-            )
-            
-            # Create market order
-            trade = self.ib_connector.market_order(
-                contract=contract,
-                quantity=quantity,
-                action='BUY'
-            )
-            
-            if trade is None:
-                self.logger.error("Failed to execute trade")
-                return {'executed': False, 'reason': 'order_failed'}
+        action = trade_decision.get('action')
+
+        if action == 'buy': # Handle single leg option buy
+            try:
+                # Extract trade details
+                symbol = trade_decision.get('symbol')
+                expiry = trade_decision.get('expiry')
+                strike = trade_decision.get('strike')
+                option_type = trade_decision.get('option_type', 'call')
+                quantity = trade_decision.get('quantity', 1)
                 
-            # Update state
-            self.day_trade_count += 1
-            self.last_trade_time = datetime.now()
-            
-            # Add position to risk manager
-            avg_price = trade.orderStatus.avgFillPrice
-            if not avg_price:
-                avg_price = trade_decision.get('price', 0.0)
+                # Convert option_type to IB format ('C' or 'P')
+                right = 'C' if option_type.lower() == 'call' else 'P'
                 
-            self.risk_manager.add_position(
-                symbol=f"{symbol}_{right}_{expiry}_{strike}",
-                quantity=quantity,
-                entry_price=avg_price,
-                position_type='option',
-                option_data={
-                    'underlying': symbol,
-                    'expiry': expiry,
-                    'strike': strike,
+                # Create option contract
+                contract = self.ib_connector.create_option_contract(
+                    symbol=symbol,
+                    expiry=expiry,
+                    strike=strike,
+                    option_type=right
+                )
+                
+                # Create market order
+                trade = self.ib_connector.market_order(
+                    contract=contract,
+                    quantity=quantity,
+                    action='BUY'
+                )
+                
+                if trade is None or not trade.orderStatus:
+                    self.logger.error(f"Failed to execute single option trade for {symbol}")
+                    return {'executed': False, 'reason': 'order_failed_or_no_status'}
+                    
+                # Update state
+                self.day_trade_count += 1
+                self.last_trade_time = datetime.now()
+                
+                avg_price = trade.orderStatus.avgFillPrice if trade.orderStatus else 0.0
+                if not avg_price: # Fallback if avgFillPrice is not available
+                    avg_price = trade_decision.get('price', 0.0) 
+                
+                self.risk_manager.add_position(
+                    symbol=f"{symbol}_{right}_{expiry}_{strike}",
+                    quantity=quantity,
+                    entry_price=avg_price,
+                    position_type='option',
+                    option_data={
+                        'underlying': symbol,
+                        'expiry': expiry,
+                        'strike': strike,
+                        'option_type': option_type,
+                        'contract': contract # Storing the qualified contract might be useful
+                    }
+                )
+                
+                self.logger.info(f"Executed trade: BUY {quantity} {symbol} {option_type} "
+                               f"@ {strike} exp:{expiry} AvgPrice: {avg_price}")
+                               
+                return {
+                    'executed': True,
+                    'trade_id': trade.order.orderId if trade.order else None,
+                    'avg_price': avg_price,
+                    'quantity': quantity,
+                    'symbol': symbol,
                     'option_type': option_type,
-                    'contract': contract
+                    'strike': strike,
+                    'expiry': expiry
                 }
-            )
             
-            self.logger.info(f"Executed trade: BUY {quantity} {symbol} {option_type} "
-                           f"@ {strike} exp:{expiry}")
-                           
-            return {
-                'executed': True,
-                'trade_id': trade.order.orderId,
-                'avg_price': avg_price,
-                'quantity': quantity,
-                'symbol': symbol,
-                'option_type': option_type,
-                'strike': strike,
-                'expiry': expiry
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error executing trade: {e}")
-            return {'executed': False, 'reason': str(e)}
+            except Exception as e:
+                self.logger.error(f"Error executing single option trade: {e}", exc_info=True)
+                return {'executed': False, 'reason': str(e)}
+
+        elif action == 'iron_condor':
+            try:
+                symbol = trade_decision.get('symbol')
+                expiry = trade_decision.get('expiry')
+                short_call_strike = trade_decision.get('short_call_strike')
+                short_put_strike = trade_decision.get('short_put_strike')
+                long_call_strike = trade_decision.get('long_call_strike')
+                long_put_strike = trade_decision.get('long_put_strike')
+                quantity = trade_decision.get('quantity')
+                net_credit_estimate = trade_decision.get('net_credit') # Estimated credit
+
+                # For Iron Condors, we are selling the spread, so we expect a credit.
+                # The IB API for BAG orders might require a positive limit price for a credit.
+                # We place a limit order at the estimated net credit.
+                # A market order for complex spreads is often not advisable due to slippage.
+                # If net_credit_estimate is positive, it's a credit.
+                # IB's limit orders for combos: BUY for a debit, SELL for a credit.
+                # Since we are *receiving* a credit, we are *selling* the condor structure.
+                
+                trade = self.ib_connector.submit_iron_condor_order(
+                    symbol=symbol,
+                    expiry=expiry,
+                    short_put_strike=short_put_strike,
+                    short_call_strike=short_call_strike,
+                    long_put_strike=long_put_strike,
+                    long_call_strike=long_call_strike,
+                    quantity=quantity,
+                    # For a credit, the price is positive. We are SELLING the condor.
+                    # The submit_iron_condor_order in ib_connector uses 'BUY' for LimitOrder by default
+                    # This needs to be 'SELL' if we expect a credit.
+                    # Let's assume submit_iron_condor_order handles the action based on price (e.g. positive for credit = SELL)
+                    # Or, more explicitly, we might need to adjust ib_connector or pass 'SELL' action here.
+                    # For now, assuming ib_connector's submit_iron_condor_order is set up to sell for a credit.
+                    # If it uses a BUY order with a positive price, that would be a DEBIT.
+                    # Let's assume the `submit_iron_condor_order` is designed to take the net_credit as the limit price
+                    # and handles the BUY/SELL action appropriately (e.g. if price > 0, it's a credit, so SELL action).
+                    # Re-checking ib_connector.py: submit_iron_condor_order uses LimitOrder('BUY', ...)
+                    # This is problematic if we want a credit. A BUY limit order for a spread means we are willing to PAY up to limit_price.
+                    # To receive a credit, we need a SELL limit order.
+                    # This will require modification in ib_connector.py or a new method.
+
+                    # TEMPORARY: For now, let's assume we will adjust ib_connector later or this is a placeholder.
+                    # The crucial part is that the 'action' for the LimitOrder for the BAG should be 'SELL' to receive a credit.
+                    limit_price=abs(net_credit_estimate) # Price must be positive for IB limit orders
+                )
+
+                if trade is None or not trade.orderStatus:
+                    self.logger.error(f"Failed to execute iron condor trade for {symbol}")
+                    return {'executed': False, 'reason': 'iron_condor_order_failed_or_no_status'}
+
+                self.day_trade_count += 1 # Counts as one complex trade
+                self.last_trade_time = datetime.now()
+
+                avg_fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus else 0.0
+                if not avg_fill_price: # Fallback
+                    avg_fill_price = net_credit_estimate # Use estimate if fill not available
+
+                # Construct a symbol for the condor
+                condor_symbol = f"{symbol}_IC_{expiry}_{long_put_strike:.0f}P_{short_put_strike:.0f}P_{short_call_strike:.0f}C_{long_call_strike:.0f}C"
+                
+                self.risk_manager.add_position(
+                    symbol=condor_symbol,
+                    quantity=quantity,
+                    entry_price=avg_fill_price, # This is the net credit received per spread
+                    position_type='iron_condor',
+                    option_data={ # Store all relevant details for the condor
+                        'underlying': symbol,
+                        'expiry': expiry,
+                        'short_put_strike': short_put_strike,
+                        'short_call_strike': short_call_strike,
+                        'long_put_strike': long_put_strike,
+                        'long_call_strike': long_call_strike,
+                        'net_credit_received': avg_fill_price,
+                        'max_risk_per_spread': trade_decision.get('max_risk'), # From options_strategy
+                        'contract': trade.contract # The BAG contract
+                    }
+                )
+
+                self.logger.info(f"Executed Iron Condor: {quantity} {condor_symbol} for a credit of {avg_fill_price:.2f} per spread")
+
+                return {
+                    'executed': True,
+                    'trade_id': trade.order.orderId if trade.order else None,
+                    'avg_price_credit': avg_fill_price,
+                    'quantity': quantity,
+                    'details': trade_decision 
+                }
+
+            except Exception as e:
+                self.logger.error(f"Error executing iron condor trade: {e}", exc_info=True)
+                return {'executed': False, 'reason': str(e)}
+
+        else:
+            self.logger.info(f"No trade to execute or unknown action: {action}")
+            return {'executed': False, 'reason': f'no_trade_action_or_unknown: {action}'}
     
     def close_all_positions(self) -> Dict:
         """

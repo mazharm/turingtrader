@@ -6,8 +6,38 @@ import configparser
 import os
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
+import logging # Added for logging
 
-from .database_config import PostgresConfig, RedisConfig
+logger = logging.getLogger(__name__) # Added for logging
+
+
+@dataclass
+class PostgresConfig:
+    """PostgreSQL/TimescaleDB configuration."""
+    host: str = "localhost"
+    port: int = 5432
+    username: str = "postgres"
+    password: str = ""
+    database: str = "turingtrader"
+    schema: str = "public"
+    ssl_mode: str = "prefer"
+    min_connections: int = 1
+    max_connections: int = 10
+    use_timescaledb: bool = True
+
+    def get_connection_string(self) -> str:
+        """Get PostgreSQL connection string."""
+        return f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}?sslmode={self.ssl_mode}"
+
+
+@dataclass
+class RedisConfig:
+    """Redis configuration."""
+    host: str = "localhost"
+    port: int = 6379
+    password: str = ""
+    database: int = 0
+    max_connections: int = 10
 
 
 @dataclass
@@ -18,6 +48,7 @@ class IBKRConfig:
     client_id: int = 1
     timeout: int = 60
     read_only: bool = False
+    default_options_exchange: str = "BOX" # Added for specifying options exchange
 
 
 @dataclass
@@ -46,6 +77,11 @@ class RiskParameters:
     
     # Minimum volatility change to trigger trading (percentage points)
     min_volatility_change: float = 2.0
+
+    # For Iron Condors: factor of max risk for stop loss (e.g., 50 means SL if loss = 50% of max risk)
+    condor_stop_loss_factor_of_max_risk: float = 50.0 
+    # For Iron Condors: factor of credit for profit target (e.g., 80 means TP if 80% of credit is retained)
+    condor_profit_target_factor_of_credit: float = 80.0
     
     def adjust_for_risk_level(self, level: int) -> None:
         """Adjust risk parameters based on risk level (1-10)."""
@@ -118,163 +154,118 @@ class VolatilityHarvestingConfig:
     max_dte: int = 45
 
 
-class Config:
-    """Main configuration class for TuringTrader."""
+@dataclass
+class AppConfig:
+    """Main application configuration, aggregating all specific configurations."""
     
-    def __init__(self, config_path: Optional[str] = None):
-        """
-        Initialize configuration from a config file.
+    ibkr: IBKRConfig = IBKRConfig()
+    risk: RiskParameters = RiskParameters()
+    trading: TradingConfig = TradingConfig()
+    postgres: PostgresConfig = PostgresConfig()
+    redis: RedisConfig = RedisConfig()
+    vol_harvesting: VolatilityHarvestingConfig = VolatilityHarvestingConfig()
         
-        Args:
-            config_path: Path to the config file. If None, looks for 'config.ini'
-                         in the current directory.
-        """
-        self.ibkr = IBKRConfig()
-        self.risk = RiskParameters()
-        self.trading = TradingConfig()
-        self.postgres = PostgresConfig()
-        self.redis = RedisConfig()
-        self.vol_harvesting = VolatilityHarvestingConfig()
-        
-        if config_path is None:
-            config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.ini')
-        
-        if os.path.exists(config_path):
-            self._load_from_file(config_path)
-    
-    def _load_from_file(self, config_path: str) -> None:
-        """Load configuration from a file."""
+    def _get_config_value(self, parser: configparser.ConfigParser, section: str, key: str, type_converter, default: Any = None) -> Any:
+        """Helper to safely get and convert config values."""
+        try:
+            return type_converter(parser.get(section, key))
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            logger.warning(f"Configuration key '{key}' not found in section '{section}'. Using default: {default}")
+            if default is None and type_converter is bool: # Handle boolean defaults specifically if parser.getboolean is not used directly
+                 return False # Or handle as per desired default boolean logic
+            return default
+        except ValueError as e:
+            logger.error(f"Invalid value for configuration: section='{section}', key='{key}'. Error: {e}. Using default: {default}")
+            return default
+
+    def load_config(self, config_file_path: str = "config.ini") -> None:
+        """Load configuration from a .ini file, overriding defaults."""
+        if not os.path.exists(config_file_path):
+            logger.warning(f"Configuration file '{config_file_path}' not found. Using default settings for all configurations.")
+            # Ensure risk parameters are adjusted even when using defaults
+            if hasattr(self.risk, 'risk_level'):
+                self.risk.adjust_for_risk_level(self.risk.risk_level)
+            return
+
         parser = configparser.ConfigParser()
-        parser.read(config_path)
+        # Add default values for boolean conversion if not present
+        parser.BOOLEAN_STATES.update({'': False, 'false': False, 'no': False, '0': False, 'true': True, 'yes': True, '1': True})
         
-        # Load IBKR configuration
-        if 'IBKR' in parser:
-            ibkr_section = parser['IBKR']
-            self.ibkr.host = ibkr_section.get('host', self.ibkr.host)
-            self.ibkr.port = ibkr_section.getint('port', self.ibkr.port)
-            self.ibkr.client_id = ibkr_section.getint('client_id', self.ibkr.client_id)
-            self.ibkr.timeout = ibkr_section.getint('timeout', self.ibkr.timeout)
-            self.ibkr.read_only = ibkr_section.getboolean('read_only', self.ibkr.read_only)
-        
-        # Load risk parameters
-        if 'Risk' in parser:
-            risk_section = parser['Risk']
-            self.risk.risk_level = risk_section.getint('risk_level', self.risk.risk_level)
+        try:
+            parser.read(config_file_path)
+        except configparser.Error as e:
+            logger.error(f"Error reading configuration file '{config_file_path}': {e}. Using default settings.")
+            if hasattr(self.risk, 'risk_level'):
+                self.risk.adjust_for_risk_level(self.risk.risk_level)
+            return
+
+        # Load IBKR settings
+        if parser.has_section("IBKR"):
+            self.ibkr.host = self._get_config_value(parser, "IBKR", "host", str, self.ibkr.host)
+            self.ibkr.port = self._get_config_value(parser, "IBKR", "port", int, self.ibkr.port)
+            self.ibkr.client_id = self._get_config_value(parser, "IBKR", "client_id", int, self.ibkr.client_id)
+            self.ibkr.timeout = self._get_config_value(parser, "IBKR", "timeout", int, self.ibkr.timeout)
+            self.ibkr.read_only = self._get_config_value(parser, "IBKR", "read_only", parser.getboolean, self.ibkr.read_only)
+            self.ibkr.default_options_exchange = self._get_config_value(parser, "IBKR", "default_options_exchange", str, self.ibkr.default_options_exchange)
+
+
+        # Load Risk settings
+        if parser.has_section("Risk"):
+            self.risk.risk_level = self._get_config_value(parser, "Risk", "risk_level", int, self.risk.risk_level)
+            self.risk.max_daily_risk_pct = self._get_config_value(parser, "Risk", "max_daily_risk_pct", float, self.risk.max_daily_risk_pct)
+            self.risk.min_volatility_threshold = self._get_config_value(parser, "Risk", "min_volatility_threshold", float, self.risk.min_volatility_threshold)
+            self.risk.max_position_size_pct = self._get_config_value(parser, "Risk", "max_position_size_pct", float, self.risk.max_position_size_pct)
+            self.risk.max_delta_exposure = self._get_config_value(parser, "Risk", "max_delta_exposure", float, self.risk.max_delta_exposure)
+            self.risk.stop_loss_pct = self._get_config_value(parser, "Risk", "stop_loss_pct", float, self.risk.stop_loss_pct) # Assuming this was intended
+            self.risk.target_profit_pct = self._get_config_value(parser, "Risk", "target_profit_pct", float, self.risk.target_profit_pct) # Assuming this was intended
+            self.risk.min_volatility_change = self._get_config_value(parser, "Risk", "min_volatility_change", float, self.risk.min_volatility_change) # Assuming this was intended
+            self.risk.condor_stop_loss_factor_of_max_risk = self._get_config_value(parser, "Risk", "condor_stop_loss_factor_of_max_risk", float, self.risk.condor_stop_loss_factor_of_max_risk)
+            self.risk.condor_profit_target_factor_of_credit = self._get_config_value(parser, "Risk", "condor_profit_target_factor_of_credit", float, self.risk.condor_profit_target_factor_of_credit)
+            
+            # Adjust risk parameters based on the loaded (or default) risk_level
             self.risk.adjust_for_risk_level(self.risk.risk_level)
-            
-            # Override auto-adjusted parameters if explicitly set
-            if 'max_daily_risk_pct' in risk_section:
-                self.risk.max_daily_risk_pct = risk_section.getfloat('max_daily_risk_pct')
-            if 'min_volatility_threshold' in risk_section:
-                self.risk.min_volatility_threshold = risk_section.getfloat('min_volatility_threshold')
-            if 'max_position_size_pct' in risk_section:
-                self.risk.max_position_size_pct = risk_section.getfloat('max_position_size_pct')
-        
-        # Load trading configuration
-        if 'Trading' in parser:
-            trading_section = parser['Trading']
-            self.trading.index_symbol = trading_section.get('index_symbol', self.trading.index_symbol)
-            self.trading.options_only = trading_section.getboolean('options_only', self.trading.options_only)
-            self.trading.trading_period_minutes = trading_section.getint('trading_period_minutes', 
-                                                                     self.trading.trading_period_minutes)
-            self.trading.day_start_offset_hours = trading_section.getfloat('day_start_offset_hours', 
-                                                                       self.trading.day_start_offset_hours)
-            self.trading.day_end_offset_hours = trading_section.getfloat('day_end_offset_hours', 
-                                                                     self.trading.day_end_offset_hours)
-        
-        # Load PostgreSQL configuration
-        if 'PostgreSQL' in parser:
-            pg_section = parser['PostgreSQL']
-            self.postgres.host = pg_section.get('host', self.postgres.host)
-            self.postgres.port = pg_section.getint('port', self.postgres.port)
-            self.postgres.username = pg_section.get('username', self.postgres.username)
-            self.postgres.password = pg_section.get('password', self.postgres.password)
-            self.postgres.database = pg_section.get('database', self.postgres.database)
-            self.postgres.schema = pg_section.get('schema', self.postgres.schema)
-            self.postgres.use_timescaledb = pg_section.getboolean('use_timescaledb', self.postgres.use_timescaledb)
-            
-        # Load Redis configuration
-        if 'Redis' in parser:
-            redis_section = parser['Redis']
-            self.redis.host = redis_section.get('host', self.redis.host)
-            self.redis.port = redis_section.getint('port', self.redis.port)
-            self.redis.password = redis_section.get('password', self.redis.password)
-            self.redis.database = redis_section.getint('database', self.redis.database)
-            self.redis.default_expiry = redis_section.getint('default_expiry', self.redis.default_expiry)
-            
-        # Load Volatility Harvesting configuration
-        if 'VolatilityHarvesting' in parser:
-            vh_section = parser['VolatilityHarvesting']
-            self.vol_harvesting.iv_hv_ratio_threshold = vh_section.getfloat('iv_hv_ratio_threshold', 
-                                                                         self.vol_harvesting.iv_hv_ratio_threshold)
-            self.vol_harvesting.min_iv_threshold = vh_section.getfloat('min_iv_threshold', 
-                                                                    self.vol_harvesting.min_iv_threshold)
-            self.vol_harvesting.use_adaptive_thresholds = vh_section.getboolean('use_adaptive_thresholds', 
-                                                                            self.vol_harvesting.use_adaptive_thresholds)
-            self.vol_harvesting.strike_width_pct = vh_section.getfloat('strike_width_pct', 
-                                                                    self.vol_harvesting.strike_width_pct)
-            self.vol_harvesting.target_short_delta = vh_section.getfloat('target_short_delta', 
-                                                                     self.vol_harvesting.target_short_delta)
-            self.vol_harvesting.target_long_delta = vh_section.getfloat('target_long_delta', 
-                                                                    self.vol_harvesting.target_long_delta)
-            self.vol_harvesting.min_dte = vh_section.getint('min_dte', self.vol_harvesting.min_dte)
-            self.vol_harvesting.max_dte = vh_section.getint('max_dte', self.vol_harvesting.max_dte)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to dictionary."""
-        return {
-            'ibkr': {
-                'host': self.ibkr.host,
-                'port': self.ibkr.port,
-                'client_id': self.ibkr.client_id,
-                'timeout': self.ibkr.timeout,
-                'read_only': self.ibkr.read_only
-            },
-            'risk': {
-                'risk_level': self.risk.risk_level,
-                'max_daily_risk_pct': self.risk.max_daily_risk_pct,
-                'min_volatility_threshold': self.risk.min_volatility_threshold,
-                'max_position_size_pct': self.risk.max_position_size_pct,
-                'max_delta_exposure': self.risk.max_delta_exposure,
-                'stop_loss_pct': self.risk.stop_loss_pct,
-                'target_profit_pct': self.risk.target_profit_pct,
-                'min_volatility_change': self.risk.min_volatility_change
-            },
-            'trading': {
-                'index_symbol': self.trading.index_symbol,
-                'options_only': self.trading.options_only,
-                'trading_period_minutes': self.trading.trading_period_minutes,
-                'day_start_offset_hours': self.trading.day_start_offset_hours,
-                'day_end_offset_hours': self.trading.day_end_offset_hours,
-                'default_order_type': self.trading.default_order_type
-            },
-            'postgres': {
-                'host': self.postgres.host,
-                'port': self.postgres.port,
-                'username': self.postgres.username,
-                'password': '********' if self.postgres.password else '',
-                'database': self.postgres.database,
-                'use_timescaledb': self.postgres.use_timescaledb
-            },
-            'redis': {
-                'host': self.redis.host,
-                'port': self.redis.port,
-                'password': '********' if self.redis.password else '',
-                'database': self.redis.database,
-                'default_expiry': self.redis.default_expiry
-            },
-            'vol_harvesting': {
-                'iv_hv_ratio_threshold': self.vol_harvesting.iv_hv_ratio_threshold,
-                'min_iv_threshold': self.vol_harvesting.min_iv_threshold,
-                'use_adaptive_thresholds': self.vol_harvesting.use_adaptive_thresholds,
-                'strike_width_pct': self.vol_harvesting.strike_width_pct,
-                'target_short_delta': self.vol_harvesting.target_short_delta,
-                'target_long_delta': self.vol_harvesting.target_long_delta,
-                'min_dte': self.vol_harvesting.min_dte,
-                'max_dte': self.vol_harvesting.max_dte
-            }
-        }
+        # Load Trading settings
+        if parser.has_section("Trading"):
+            self.trading.index_symbol = self._get_config_value(parser, "Trading", "index_symbol", str, self.trading.index_symbol)
+            self.trading.options_only = self._get_config_value(parser, "Trading", "options_only", parser.getboolean, self.trading.options_only)
+            self.trading.trading_period_minutes = self._get_config_value(parser, "Trading", "trading_period_minutes", int, self.trading.trading_period_minutes)
+            self.trading.day_start_offset_hours = self._get_config_value(parser, "Trading", "day_start_offset_hours", float, self.trading.day_start_offset_hours)
+            self.trading.day_end_offset_hours = self._get_config_value(parser, "Trading", "day_end_offset_hours", float, self.trading.day_end_offset_hours)
+            self.trading.default_order_type = self._get_config_value(parser, "Trading", "default_order_type", str, self.trading.default_order_type)
 
+        # Load PostgreSQL settings
+        if parser.has_section("PostgreSQL"):
+            self.postgres.host = self._get_config_value(parser, "PostgreSQL", "host", str, self.postgres.host)
+            self.postgres.port = self._get_config_value(parser, "PostgreSQL", "port", int, self.postgres.port)
+            self.postgres.username = self._get_config_value(parser, "PostgreSQL", "username", str, self.postgres.username)
+            self.postgres.password = self._get_config_value(parser, "PostgreSQL", "password", str, self.postgres.password)
+            self.postgres.database = self._get_config_value(parser, "PostgreSQL", "database", str, self.postgres.database)
+            self.postgres.schema = self._get_config_value(parser, "PostgreSQL", "schema", str, self.postgres.schema)
+            self.postgres.ssl_mode = self._get_config_value(parser, "PostgreSQL", "ssl_mode", str, self.postgres.ssl_mode)
+            self.postgres.min_connections = self._get_config_value(parser, "PostgreSQL", "min_connections", int, self.postgres.min_connections)
+            self.postgres.max_connections = self._get_config_value(parser, "PostgreSQL", "max_connections", int, self.postgres.max_connections)
+            self.postgres.use_timescaledb = self._get_config_value(parser, "PostgreSQL", "use_timescaledb", parser.getboolean, self.postgres.use_timescaledb)
+
+        # Load Redis settings
+        if parser.has_section("Redis"):
+            self.redis.host = self._get_config_value(parser, "Redis", "host", str, self.redis.host)
+            self.redis.port = self._get_config_value(parser, "Redis", "port", int, self.redis.port)
+            self.redis.password = self._get_config_value(parser, "Redis", "password", str, self.redis.password)
+            self.redis.database = self._get_config_value(parser, "Redis", "database", int, self.redis.database)
+            self.redis.max_connections = self._get_config_value(parser, "Redis", "max_connections", int, self.redis.max_connections)
+            # Assuming default_expiry is part of RedisConfig or handled elsewhere if needed from .ini
+            # self.redis.default_expiry = self._get_config_value(parser, "Redis", "default_expiry", int, self.redis.default_expiry)
+
+
+        # Load VolatilityHarvesting settings
+        if parser.has_section("VolatilityHarvesting"):
+            self.volatility_harvesting.iv_hv_ratio_threshold = self._get_config_value(parser, "VolatilityHarvesting", "iv_hv_ratio_threshold", float, self.volatility_harvesting.iv_hv_ratio_threshold)
+            self.volatility_harvesting.min_iv_threshold = self._get_config_value(parser, "VolatilityHarvesting", "min_iv_threshold", float, self.volatility_harvesting.min_iv_threshold)
+            self.volatility_harvesting.use_adaptive_thresholds = self._get_config_value(parser, "VolatilityHarvesting", "use_adaptive_thresholds", parser.getboolean, self.volatility_harvesting.use_adaptive_thresholds)
+            # Add other VolatilityHarvesting parameters as needed
+
+        logger.info("Configuration loaded successfully.")
 
 def create_default_config_file(filename: str = 'config.ini') -> None:
     """Create a default configuration file."""
@@ -285,12 +276,15 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
         'port': '7497',  # Paper trading
         'client_id': '1',
         'timeout': '60',
-        'read_only': 'False'
+        'read_only': 'False',
+        'default_options_exchange': 'BOX'
     }
     
     config['Risk'] = {
         'risk_level': '5',
-        'comment': 'Risk level range: 1 (lowest) to 10 (highest)'
+        'comment': 'Risk level range: 1 (lowest) to 10 (highest)',
+        'condor_stop_loss_factor_of_max_risk': '50.0', # Example: SL if 50% of max risk is lost
+        'condor_profit_target_factor_of_credit': '80.0' # Example: TP if 80% of credit can be kept (i.e. buy back for 20% of credit)
     }
     
     config['Trading'] = {
