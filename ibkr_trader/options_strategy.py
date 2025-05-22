@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from .config import Config
 from .volatility_analyzer import VolatilityAnalyzer
 from .risk_manager import RiskManager
+try:
+    from .market_data_store import MarketDataStore
+except ImportError:
+    MarketDataStore = None
 
 
 class OptionsStrategy:
@@ -35,8 +39,18 @@ class OptionsStrategy:
         self.volatility_analyzer = volatility_analyzer or VolatilityAnalyzer(self.config)
         self.risk_manager = risk_manager or RiskManager(self.config)
         
+        # Initialize market data store if available
+        self.market_data_store = MarketDataStore(self.config) if MarketDataStore else None
+        
         # Default parameters
         self.index_symbol = self.config.trading.index_symbol
+        
+        # Iron condor parameters
+        self.strike_width_pct = self.config.vol_harvesting.strike_width_pct
+        self.target_short_delta = self.config.vol_harvesting.target_short_delta
+        self.target_long_delta = self.config.vol_harvesting.target_long_delta
+        self.min_dte = self.config.vol_harvesting.min_dte
+        self.max_dte = self.config.vol_harvesting.max_dte
         
         # State tracking
         self.current_vix = 0.0
@@ -398,6 +412,281 @@ class OptionsStrategy:
         self.last_trade_time = None
         self.risk_manager.reset_daily_metrics()
         self.logger.info("Daily state reset for new trading day")
+
+    def find_iron_condor_legs(
+        self,
+        option_chain: Dict,
+        current_price: float,
+        expiry_target: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Find appropriate legs for an iron condor spread.
+        
+        Args:
+            option_chain: Option chain data
+            current_price: Current price of the underlying
+            expiry_target: Target expiry date (if None, will select based on DTE range)
+            
+        Returns:
+            Dictionary with iron condor leg details or None if no suitable legs found
+        """
+        if not option_chain:
+            self.logger.warning("No option chain data provided")
+            return None
+            
+        self.logger.info(f"Finding iron condor legs at price {current_price}")
+        
+        # Find expiry date within target range
+        target_expiry = None
+        if expiry_target and expiry_target in option_chain:
+            target_expiry = expiry_target
+        else:
+            # Filter by DTE range
+            valid_expiries = [
+                exp for exp, data in option_chain.items()
+                if self.min_dte <= data.get('days_to_expiry', 0) <= self.max_dte
+            ]
+            
+            if valid_expiries:
+                # Choose the one with the highest IV
+                best_expiry = None
+                best_iv = 0
+                
+                for exp in valid_expiries:
+                    exp_data = option_chain[exp]
+                    calls = exp_data.get('calls', {})
+                    puts = exp_data.get('puts', {})
+                    
+                    # Calculate average IV
+                    call_ivs = [opt.get('iv', 0) for opt in calls.values() if opt.get('iv', 0) > 0]
+                    put_ivs = [opt.get('iv', 0) for opt in puts.values() if opt.get('iv', 0) > 0]
+                    
+                    if call_ivs and put_ivs:
+                        avg_iv = (sum(call_ivs) + sum(put_ivs)) / (len(call_ivs) + len(put_ivs))
+                        if avg_iv > best_iv:
+                            best_iv = avg_iv
+                            best_expiry = exp
+                
+                target_expiry = best_expiry
+        
+        if not target_expiry:
+            self.logger.warning("No suitable expiry date found for iron condor")
+            return None
+            
+        # Get expiry data
+        expiry_data = option_chain[target_expiry]
+        days_to_expiry = expiry_data.get('days_to_expiry', 0)
+        calls = expiry_data.get('calls', {})
+        puts = expiry_data.get('puts', {})
+        
+        # Get available strikes
+        strikes = sorted(set(list(calls.keys()) + list(puts.keys())))
+        if not strikes:
+            self.logger.warning("No valid strikes found")
+            return None
+            
+        # Find short legs (inner legs) based on delta target
+        # For a short call, we want delta around -0.30 (equiv to 0.30 delta for a call)
+        # For a short put, we want delta around -0.30 (equiv to 0.30 delta for a put)
+        
+        # First find the ATM strike (closest to current price)
+        atm_strike = min(strikes, key=lambda x: abs(x - current_price))
+        atm_index = strikes.index(atm_strike)
+        
+        # Find short call (OTM call with delta closest to target)
+        short_call_strike = None
+        short_call = None
+        short_call_delta = 0
+        
+        for i in range(atm_index, len(strikes)):
+            strike = strikes[i]
+            if strike > current_price and strike in calls:  # OTM call
+                call = calls[strike]
+                # Estimate delta if not available
+                delta = call.get('delta', abs(1 - (strike / current_price)))
+                if delta <= self.target_short_delta:
+                    short_call_strike = strike
+                    short_call = call
+                    short_call_delta = delta
+                    break
+        
+        # Find short put (OTM put with delta closest to target)
+        short_put_strike = None
+        short_put = None
+        short_put_delta = 0
+        
+        for i in range(atm_index, -1, -1):
+            strike = strikes[i]
+            if strike < current_price and strike in puts:  # OTM put
+                put = puts[strike]
+                # Estimate delta if not available
+                delta = put.get('delta', abs(1 - (strike / current_price)))
+                if delta <= self.target_short_delta:
+                    short_put_strike = strike
+                    short_put = put
+                    short_put_delta = delta
+                    break
+        
+        # If we can't find appropriate short legs, return None
+        if not short_call_strike or not short_put_strike:
+            self.logger.warning("Could not find appropriate short legs for iron condor")
+            return None
+        
+        # Calculate distance between strikes based on percentage
+        strike_width = current_price * (self.strike_width_pct / 100)
+        
+        # Find long call (higher strike than short call)
+        long_call_strike = None
+        long_call = None
+        
+        # Try to find a strike approximately strike_width away
+        target_long_call_strike = short_call_strike + strike_width
+        long_call_strike = min(
+            [s for s in strikes if s > short_call_strike],
+            key=lambda x: abs(x - target_long_call_strike)
+        )
+        if long_call_strike in calls:
+            long_call = calls[long_call_strike]
+        else:
+            self.logger.warning(f"No call found at target strike {long_call_strike}")
+            return None
+        
+        # Find long put (lower strike than short put)
+        long_put_strike = None
+        long_put = None
+        
+        # Try to find a strike approximately strike_width away
+        target_long_put_strike = short_put_strike - strike_width
+        long_put_strike = max(
+            [s for s in strikes if s < short_put_strike],
+            key=lambda x: abs(x - target_long_put_strike)
+        )
+        if long_put_strike in puts:
+            long_put = puts[long_put_strike]
+        else:
+            self.logger.warning(f"No put found at target strike {long_put_strike}")
+            return None
+        
+        # Calculate mid prices for the options
+        short_call_price = (short_call.get('bid', 0) + short_call.get('ask', 0)) / 2
+        short_put_price = (short_put.get('bid', 0) + short_put.get('ask', 0)) / 2
+        long_call_price = (long_call.get('bid', 0) + long_call.get('ask', 0)) / 2
+        long_put_price = (long_put.get('bid', 0) + long_put.get('ask', 0)) / 2
+        
+        # Calculate credit received
+        net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
+        
+        # Calculate max risk (width between strikes minus credit received)
+        call_spread_width = long_call_strike - short_call_strike
+        put_spread_width = short_put_strike - long_put_strike
+        max_risk = min(call_spread_width, put_spread_width) - net_credit
+        
+        # Calculate return on risk
+        return_on_risk = (net_credit / max_risk) if max_risk > 0 else 0
+        
+        # Calculate return_on_risk
+        # Create iron condor details
+        iron_condor = {
+            'strategy': 'iron_condor',
+            'expiry': target_expiry,
+            'days_to_expiry': days_to_expiry,
+            'short_call_strike': short_call_strike,
+            'short_put_strike': short_put_strike,
+            'long_call_strike': long_call_strike,
+            'long_put_strike': long_put_strike,
+            'short_call_price': short_call_price,
+            'short_put_price': short_put_price,
+            'long_call_price': long_call_price,
+            'long_put_price': long_put_price,
+            'net_credit': net_credit,
+            'max_risk': max_risk,
+            'return_on_risk': return_on_risk,
+            'short_call_delta': short_call_delta,
+            'short_put_delta': short_put_delta
+        }
+        
+        self.logger.info(f"Found iron condor: {target_expiry} expiry, "
+                       f"short put @ {short_put_strike}, short call @ {short_call_strike}, "
+                       f"credit: {net_credit:.2f}, RoR: {return_on_risk:.2f}")
+                       
+        return iron_condor
+        
+    def generate_iron_condor_trade(
+        self, 
+        option_chain: Dict, 
+        current_price: float,
+        account_value: float,
+        vix_analysis: Dict
+    ) -> Dict:
+        """
+        Generate an iron condor trade decision.
+        
+        Args:
+            option_chain: Option chain data
+            current_price: Current price of the underlying
+            account_value: Current account value
+            vix_analysis: VIX analysis data
+            
+        Returns:
+            Dictionary with trade decision
+        """
+        # Find iron condor legs
+        iron_condor = self.find_iron_condor_legs(option_chain, current_price)
+        
+        if not iron_condor:
+            self.logger.info("No suitable iron condor found")
+            return {
+                'action': 'none',
+                'reason': 'no_suitable_iron_condor'
+            }
+        
+        # Get position size multiplier
+        vol_harvest_analysis = self.volatility_analyzer.analyze_volatility_for_harvesting(
+            self.index_symbol, vix_analysis, option_chain
+        )
+        
+        position_size_multiplier = 0.0
+        if vol_harvest_analysis['signal'] == 'strong_volatility_harvest':
+            position_size_multiplier = 1.0
+        elif vol_harvest_analysis['signal'] == 'volatility_harvest':
+            position_size_multiplier = 0.7
+        else:
+            position_size_multiplier = 0.5
+        
+        # Risk only what we're willing to lose (max risk * quantity)
+        max_risk_amount = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0) * position_size_multiplier
+        
+        # Calculate quantity
+        quantity = int(max_risk_amount / iron_condor['max_risk']) if iron_condor['max_risk'] > 0 else 1
+        quantity = max(1, quantity)  # At least 1 contract
+        
+        # Build trade decision
+        trade_decision = {
+            'action': 'iron_condor',
+            'symbol': self.index_symbol,
+            'expiry': iron_condor['expiry'],
+            'short_call_strike': iron_condor['short_call_strike'],
+            'short_put_strike': iron_condor['short_put_strike'],
+            'long_call_strike': iron_condor['long_call_strike'],
+            'long_put_strike': iron_condor['long_put_strike'],
+            'quantity': quantity,
+            'net_credit': iron_condor['net_credit'],
+            'max_risk': iron_condor['max_risk'],
+            'return_on_risk': iron_condor['return_on_risk'],
+            'vix': vix_analysis.get('current_vix', 0.0),
+            'iv_hv_ratio': vol_harvest_analysis.get('iv_hv_ratio', 0.0),
+            'reason': vol_harvest_analysis.get('signal', 'volatility_harvest')
+        }
+        
+        self.logger.info(f"Generated iron condor trade: {quantity} contracts, "
+                       f"width: {iron_condor['long_call_strike'] - iron_condor['short_call_strike']}, "
+                       f"credit: {iron_condor['net_credit']:.2f}, "
+                       f"max risk: {iron_condor['max_risk'] * quantity:.2f}")
+                       
+        self.last_trade_time = datetime.now()
+        self.todays_trades.append(trade_decision)
+        
+        return trade_decision
 
 
 if __name__ == "__main__":

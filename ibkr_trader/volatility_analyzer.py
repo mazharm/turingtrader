@@ -14,6 +14,10 @@ import pandas as pd
 from scipy.stats import norm
 
 from .config import Config
+try:
+    from .market_data_store import MarketDataStore
+except ImportError:
+    MarketDataStore = None
 
 
 class VolatilityAnalyzer:
@@ -35,9 +39,22 @@ class VolatilityAnalyzer:
         self.min_volatility_threshold = self.config.risk.min_volatility_threshold
         self.min_volatility_change = self.config.risk.min_volatility_change
         
+        # Load volatility harvesting configurations
+        self.iv_hv_ratio_threshold = self.config.vol_harvesting.iv_hv_ratio_threshold
+        self.min_iv_threshold = self.config.vol_harvesting.min_iv_threshold
+        self.use_adaptive_thresholds = self.config.vol_harvesting.use_adaptive_thresholds
+        
         # Historical data
         self.historical_volatility = []
         self.vix_history = []
+        self.iv_hv_ratios = []
+        
+        # Initialize market data store if available
+        self.market_data_store = MarketDataStore(config) if MarketDataStore else None
+        
+        # Initialize adaptive thresholds
+        self.adaptive_iv_threshold = self.min_iv_threshold
+        self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
         
     def calculate_historical_volatility(self, prices: List[float], 
                                       window: int = 20, 
@@ -414,6 +431,157 @@ class VolatilityAnalyzer:
             return 0.0
 
 
+    def get_iv_hv_ratio(self, symbol: str, expiry: Optional[str] = None) -> float:
+        """
+        Calculate IV/HV ratio for a symbol.
+        
+        Args:
+            symbol: Ticker symbol
+            expiry: Option expiry (if None, uses nearest expiry)
+            
+        Returns:
+            float: IV/HV ratio (IV/HV)
+        """
+        if self.market_data_store:
+            return self.market_data_store.get_iv_hv_ratio(symbol, expiry)
+        
+        return 1.0  # Default if no market data store
+    
+    def update_adaptive_thresholds(self, current_vix: float) -> None:
+        """
+        Update adaptive thresholds based on current market conditions.
+        
+        Args:
+            current_vix: Current VIX value
+        """
+        if not self.use_adaptive_thresholds:
+            return
+            
+        # Update IV threshold based on VIX
+        # In higher volatility environments, we need higher IV for signals
+        if current_vix > 30:
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.3
+        elif current_vix > 25:
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.2
+        elif current_vix > 20:
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.1
+        elif current_vix < 15:
+            self.adaptive_iv_threshold = self.min_iv_threshold * 0.9
+        else:
+            self.adaptive_iv_threshold = self.min_iv_threshold
+        
+        # Update IV/HV ratio threshold based on VIX volatility
+        # In more volatile VIX environments, we can lower our ratio threshold
+        if len(self.vix_history) >= 5:
+            vix_std = np.std(self.vix_history[-5:])
+            if vix_std > 2.0:  # Very volatile VIX
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.85
+            elif vix_std > 1.0:  # Moderately volatile VIX
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.95
+            elif vix_std < 0.5:  # Very stable VIX
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.1
+            else:
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
+    
+    def analyze_volatility_for_harvesting(self, 
+                                        symbol: str,
+                                        vix_analysis: Dict, 
+                                        option_chain: Optional[Dict] = None) -> Dict:
+        """
+        Analyze volatility for the enhanced volatility-harvesting system.
+        
+        Args:
+            symbol: Ticker symbol
+            vix_analysis: VIX analysis data
+            option_chain: Option chain data (optional)
+            
+        Returns:
+            Dictionary with volatility harvesting analysis
+        """
+        result = {
+            'signal': 'none',
+            'strategy': 'none',
+            'iv_hv_ratio': 0.0,
+            'historical_volatility': 0.0,
+            'implied_volatility': 0.0,
+            'vix': vix_analysis.get('current_vix', 0.0),
+            'adaptive_iv_threshold': self.adaptive_iv_threshold,
+            'adaptive_iv_hv_ratio': self.adaptive_iv_hv_ratio
+        }
+        
+        try:
+            # Update adaptive thresholds
+            current_vix = vix_analysis.get('current_vix', 0.0)
+            self.update_adaptive_thresholds(current_vix)
+            
+            # Calculate historical volatility
+            hv = 0.0
+            if self.market_data_store:
+                hv = self.market_data_store.calculate_historical_volatility(symbol)
+            elif len(self.historical_volatility) > 0:
+                hv = self.historical_volatility[-1]
+            
+            result['historical_volatility'] = hv
+            
+            # Calculate implied volatility
+            iv = 0.0
+            if option_chain:
+                # Extract all IVs from the option chain
+                all_ivs = []
+                for expiry_data in option_chain.values():
+                    for call in expiry_data.get('calls', {}).values():
+                        if call.get('iv', 0) > 0:
+                            all_ivs.append(call['iv'])
+                    for put in expiry_data.get('puts', {}).values():
+                        if put.get('iv', 0) > 0:
+                            all_ivs.append(put['iv'])
+                
+                if all_ivs:
+                    iv = np.mean(all_ivs) * 100  # Convert to percentage
+            
+            result['implied_volatility'] = iv
+            
+            # Calculate IV/HV ratio
+            iv_hv_ratio = 0.0
+            if hv > 0:
+                iv_hv_ratio = iv / hv
+            else:
+                # Use the market data store if available
+                iv_hv_ratio = self.get_iv_hv_ratio(symbol)
+                
+            result['iv_hv_ratio'] = iv_hv_ratio
+            self.iv_hv_ratios.append(iv_hv_ratio)
+            
+            # Keep only the most recent 20 ratios
+            if len(self.iv_hv_ratios) > 20:
+                self.iv_hv_ratios = self.iv_hv_ratios[-20:]
+            
+            # Determine signal based on IV/HV ratio and other factors
+            if iv_hv_ratio >= self.adaptive_iv_hv_ratio and iv >= self.adaptive_iv_threshold:
+                # Check VIX state and trend
+                vix_signal = vix_analysis.get('signal', 'none')
+                
+                if vix_signal in ['buy', 'strong_buy']:
+                    # Strong signal
+                    result['signal'] = 'strong_volatility_harvest'
+                    result['strategy'] = 'iron_condor'
+                elif vix_signal == 'hold' and iv_hv_ratio >= self.adaptive_iv_hv_ratio * 1.2:
+                    # Elevated IV/HV ratio, even if VIX isn't rising
+                    result['signal'] = 'volatility_harvest'
+                    result['strategy'] = 'iron_condor'
+                else:
+                    result['signal'] = 'monitor'
+            else:
+                result['signal'] = 'wait'
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in volatility harvesting analysis: {e}")
+            result['error'] = str(e)
+            return result
+
+
 if __name__ == "__main__":
     # Test code
     logging.basicConfig(level=logging.INFO)
@@ -438,3 +606,8 @@ if __name__ == "__main__":
     print("VIX Analysis:", vix_analysis)
     print(f"Should trade today: {analyzer.should_trade_today(vix_analysis)}")
     print(f"Position size multiplier: {analyzer.get_position_size_multiplier(vix_analysis):.2f}")
+    
+    # Test volatility harvesting analysis
+    test_symbol = "SPY"
+    vh_analysis = analyzer.analyze_volatility_for_harvesting(test_symbol, vix_analysis)
+    print(f"Volatility Harvesting Analysis: {vh_analysis}")
