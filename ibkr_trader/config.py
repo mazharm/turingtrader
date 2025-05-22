@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 
+from .database_config import PostgresConfig, RedisConfig
+
 
 @dataclass
 class IBKRConfig:
@@ -90,6 +92,32 @@ class TradingConfig:
     default_order_type: str = "MKT"
 
 
+@dataclass
+class VolatilityHarvestingConfig:
+    """Configuration for the Adaptive Volatility-Harvesting System."""
+    # IV/HV ratio threshold for signal generation
+    iv_hv_ratio_threshold: float = 1.2
+    
+    # Minimum IV required for trade entry
+    min_iv_threshold: float = 25.0
+    
+    # Use adaptive thresholds based on market conditions
+    use_adaptive_thresholds: bool = True
+    
+    # Range around calculated strikes for iron condor legs (percentage)
+    strike_width_pct: float = 1.0
+    
+    # Target delta for short options legs
+    target_short_delta: float = 0.3
+    
+    # Target delta for long options legs
+    target_long_delta: float = 0.1
+    
+    # Default days to expiration range
+    min_dte: int = 14
+    max_dte: int = 45
+
+
 class Config:
     """Main configuration class for TuringTrader."""
     
@@ -104,6 +132,9 @@ class Config:
         self.ibkr = IBKRConfig()
         self.risk = RiskParameters()
         self.trading = TradingConfig()
+        self.postgres = PostgresConfig()
+        self.redis = RedisConfig()
+        self.vol_harvesting = VolatilityHarvestingConfig()
         
         if config_path is None:
             config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.ini')
@@ -150,6 +181,44 @@ class Config:
                                                                        self.trading.day_start_offset_hours)
             self.trading.day_end_offset_hours = trading_section.getfloat('day_end_offset_hours', 
                                                                      self.trading.day_end_offset_hours)
+        
+        # Load PostgreSQL configuration
+        if 'PostgreSQL' in parser:
+            pg_section = parser['PostgreSQL']
+            self.postgres.host = pg_section.get('host', self.postgres.host)
+            self.postgres.port = pg_section.getint('port', self.postgres.port)
+            self.postgres.username = pg_section.get('username', self.postgres.username)
+            self.postgres.password = pg_section.get('password', self.postgres.password)
+            self.postgres.database = pg_section.get('database', self.postgres.database)
+            self.postgres.schema = pg_section.get('schema', self.postgres.schema)
+            self.postgres.use_timescaledb = pg_section.getboolean('use_timescaledb', self.postgres.use_timescaledb)
+            
+        # Load Redis configuration
+        if 'Redis' in parser:
+            redis_section = parser['Redis']
+            self.redis.host = redis_section.get('host', self.redis.host)
+            self.redis.port = redis_section.getint('port', self.redis.port)
+            self.redis.password = redis_section.get('password', self.redis.password)
+            self.redis.database = redis_section.getint('database', self.redis.database)
+            self.redis.default_expiry = redis_section.getint('default_expiry', self.redis.default_expiry)
+            
+        # Load Volatility Harvesting configuration
+        if 'VolatilityHarvesting' in parser:
+            vh_section = parser['VolatilityHarvesting']
+            self.vol_harvesting.iv_hv_ratio_threshold = vh_section.getfloat('iv_hv_ratio_threshold', 
+                                                                         self.vol_harvesting.iv_hv_ratio_threshold)
+            self.vol_harvesting.min_iv_threshold = vh_section.getfloat('min_iv_threshold', 
+                                                                    self.vol_harvesting.min_iv_threshold)
+            self.vol_harvesting.use_adaptive_thresholds = vh_section.getboolean('use_adaptive_thresholds', 
+                                                                            self.vol_harvesting.use_adaptive_thresholds)
+            self.vol_harvesting.strike_width_pct = vh_section.getfloat('strike_width_pct', 
+                                                                    self.vol_harvesting.strike_width_pct)
+            self.vol_harvesting.target_short_delta = vh_section.getfloat('target_short_delta', 
+                                                                     self.vol_harvesting.target_short_delta)
+            self.vol_harvesting.target_long_delta = vh_section.getfloat('target_long_delta', 
+                                                                    self.vol_harvesting.target_long_delta)
+            self.vol_harvesting.min_dte = vh_section.getint('min_dte', self.vol_harvesting.min_dte)
+            self.vol_harvesting.max_dte = vh_section.getint('max_dte', self.vol_harvesting.max_dte)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -178,6 +247,31 @@ class Config:
                 'day_start_offset_hours': self.trading.day_start_offset_hours,
                 'day_end_offset_hours': self.trading.day_end_offset_hours,
                 'default_order_type': self.trading.default_order_type
+            },
+            'postgres': {
+                'host': self.postgres.host,
+                'port': self.postgres.port,
+                'username': self.postgres.username,
+                'password': '********' if self.postgres.password else '',
+                'database': self.postgres.database,
+                'use_timescaledb': self.postgres.use_timescaledb
+            },
+            'redis': {
+                'host': self.redis.host,
+                'port': self.redis.port,
+                'password': '********' if self.redis.password else '',
+                'database': self.redis.database,
+                'default_expiry': self.redis.default_expiry
+            },
+            'vol_harvesting': {
+                'iv_hv_ratio_threshold': self.vol_harvesting.iv_hv_ratio_threshold,
+                'min_iv_threshold': self.vol_harvesting.min_iv_threshold,
+                'use_adaptive_thresholds': self.vol_harvesting.use_adaptive_thresholds,
+                'strike_width_pct': self.vol_harvesting.strike_width_pct,
+                'target_short_delta': self.vol_harvesting.target_short_delta,
+                'target_long_delta': self.vol_harvesting.target_long_delta,
+                'min_dte': self.vol_harvesting.min_dte,
+                'max_dte': self.vol_harvesting.max_dte
             }
         }
 
@@ -206,6 +300,34 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
         'day_start_offset_hours': '0.5',
         'day_end_offset_hours': '0.5',
         'default_order_type': 'MKT'
+    }
+    
+    config['PostgreSQL'] = {
+        'host': 'localhost',
+        'port': '5432',
+        'username': 'postgres',
+        'password': '',
+        'database': 'turingtrader',
+        'use_timescaledb': 'True'
+    }
+    
+    config['Redis'] = {
+        'host': 'localhost',
+        'port': '6379',
+        'password': '',
+        'database': '0',
+        'default_expiry': '3600'
+    }
+    
+    config['VolatilityHarvesting'] = {
+        'iv_hv_ratio_threshold': '1.2',
+        'min_iv_threshold': '25.0',
+        'use_adaptive_thresholds': 'True',
+        'strike_width_pct': '1.0',
+        'target_short_delta': '0.3',
+        'target_long_delta': '0.1',
+        'min_dte': '14',
+        'max_dte': '45'
     }
     
     with open(filename, 'w') as f:

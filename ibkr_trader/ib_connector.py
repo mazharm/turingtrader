@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 # Import IB-insync for Interactive Brokers API
 try:
     from ib_insync import IB, Contract, Option, Stock, Order, MarketOrder, LimitOrder
-    from ib_insync import util as ib_util
+    from ib_insync import ComboLeg, Bag, util as ib_util
 except ImportError:
     logging.error("ib_insync package not found. Please install with: pip install ib_insync")
     raise
@@ -533,6 +533,220 @@ class IBConnector:
     def get_last_error(self) -> Optional[str]:
         """Get the last error message."""
         return self._last_error
+        
+    def create_iron_condor_contract(self,
+                              symbol: str,
+                              expiry: str,  # Format: YYYYMMDD
+                              short_put_strike: float,
+                              short_call_strike: float,
+                              long_put_strike: float,
+                              long_call_strike: float,
+                              exchange: str = 'SMART',
+                              currency: str = 'USD') -> Bag:
+        """
+        Create an iron condor combination contract.
+        
+        Args:
+            symbol: Underlying symbol
+            expiry: Option expiry date in YYYYMMDD format
+            short_put_strike: Strike price for short put
+            short_call_strike: Strike price for short call
+            long_put_strike: Strike price for long put
+            long_call_strike: Strike price for long call
+            exchange: Exchange name
+            currency: Currency code
+            
+        Returns:
+            Bag contract representing the iron condor
+        """
+        # Create combo legs for iron condor
+        legs = []
+        
+        # Long put leg (buy)
+        legs.append(ComboLeg(
+            conId=0,  # Will be filled by IB
+            ratio=1,
+            action='BUY',
+            exchange=exchange,
+            designatedLocation='',  # Local Symbol
+            openClose=0  # Open position
+        ))
+        
+        # Short put leg (sell)
+        legs.append(ComboLeg(
+            conId=0,  # Will be filled by IB
+            ratio=1,
+            action='SELL',
+            exchange=exchange,
+            designatedLocation='',
+            openClose=0
+        ))
+        
+        # Short call leg (sell)
+        legs.append(ComboLeg(
+            conId=0,  # Will be filled by IB
+            ratio=1,
+            action='SELL',
+            exchange=exchange,
+            designatedLocation='',
+            openClose=0
+        ))
+        
+        # Long call leg (buy)
+        legs.append(ComboLeg(
+            conId=0,  # Will be filled by IB
+            ratio=1,
+            action='BUY',
+            exchange=exchange,
+            designatedLocation='',
+            openClose=0
+        ))
+        
+        # Create individual option contracts to get contract IDs
+        long_put = Option(symbol, expiry, long_put_strike, 'P', exchange, currency)
+        short_put = Option(symbol, expiry, short_put_strike, 'P', exchange, currency)
+        short_call = Option(symbol, expiry, short_call_strike, 'C', exchange, currency)
+        long_call = Option(symbol, expiry, long_call_strike, 'C', exchange, currency)
+        
+        # Qualify contracts to get contract IDs
+        self.ib.qualifyContracts(long_put, short_put, short_call, long_call)
+        
+        # Update combo legs with contract IDs
+        legs[0].conId = long_put.conId
+        legs[1].conId = short_put.conId
+        legs[2].conId = short_call.conId
+        legs[3].conId = long_call.conId
+        
+        # Create bag (combination) contract
+        bag = Bag(symbol, exchange, currency)
+        bag.comboLegs = legs
+        
+        # Set a descriptive name
+        bag.symbol = symbol
+        
+        return bag
+        
+    def submit_iron_condor_order(self,
+                               symbol: str,
+                               expiry: str,
+                               short_put_strike: float,
+                               short_call_strike: float,
+                               long_put_strike: float,
+                               long_call_strike: float,
+                               quantity: int,
+                               limit_price: Optional[float] = None,
+                               exchange: str = 'SMART',
+                               currency: str = 'USD') -> Any:
+        """
+        Submit an iron condor order.
+        
+        Args:
+            symbol: Underlying symbol
+            expiry: Option expiry date in YYYYMMDD format
+            short_put_strike: Strike price for short put
+            short_call_strike: Strike price for short call
+            long_put_strike: Strike price for long put
+            long_call_strike: Strike price for long call
+            quantity: Number of iron condor spreads
+            limit_price: Limit price for the entire spread (credit received)
+            exchange: Exchange name
+            currency: Currency code
+            
+        Returns:
+            Trade object if successful, None otherwise
+        """
+        if not self.check_connection():
+            return None
+            
+        try:
+            # Create iron condor contract
+            bag_contract = self.create_iron_condor_contract(
+                symbol, expiry, short_put_strike, short_call_strike,
+                long_put_strike, long_call_strike, exchange, currency
+            )
+            
+            # Create order
+            if limit_price is not None:
+                # Use limit order with specified credit
+                order = LimitOrder('BUY', quantity, limit_price)
+            else:
+                # Use market order
+                order = MarketOrder('BUY', quantity)
+                
+            # Submit order
+            trade = self.submit_order(bag_contract, order)
+            
+            if trade:
+                self.logger.info(f"Submitted iron condor order for {symbol}, "
+                               f"Qty: {quantity}, Expiry: {expiry}, "
+                               f"Strikes: {long_put_strike}/{short_put_strike}/{short_call_strike}/{long_call_strike}")
+                
+            return trade
+            
+        except Exception as e:
+            self.logger.error(f"Error submitting iron condor order: {e}")
+            return None
+            
+    def close_iron_condor(self,
+                        symbol: str,
+                        expiry: str,
+                        short_put_strike: float,
+                        short_call_strike: float,
+                        long_put_strike: float,
+                        long_call_strike: float,
+                        quantity: int,
+                        limit_price: Optional[float] = None,
+                        exchange: str = 'SMART',
+                        currency: str = 'USD') -> Any:
+        """
+        Close an iron condor position.
+        
+        Args:
+            symbol: Underlying symbol
+            expiry: Option expiry date in YYYYMMDD format
+            short_put_strike: Strike price for short put
+            short_call_strike: Strike price for short call
+            long_put_strike: Strike price for long put
+            long_call_strike: Strike price for long call
+            quantity: Number of iron condor spreads to close
+            limit_price: Limit price for closing (debit paid)
+            exchange: Exchange name
+            currency: Currency code
+            
+        Returns:
+            Trade object if successful, None otherwise
+        """
+        if not self.check_connection():
+            return None
+            
+        try:
+            # Create iron condor contract
+            bag_contract = self.create_iron_condor_contract(
+                symbol, expiry, short_put_strike, short_call_strike,
+                long_put_strike, long_call_strike, exchange, currency
+            )
+            
+            # Create order (SELL to close a BUY position)
+            if limit_price is not None:
+                # Use limit order with specified debit
+                order = LimitOrder('SELL', quantity, limit_price)
+            else:
+                # Use market order
+                order = MarketOrder('SELL', quantity)
+                
+            # Submit order
+            trade = self.submit_order(bag_contract, order)
+            
+            if trade:
+                self.logger.info(f"Submitted order to close iron condor for {symbol}, "
+                               f"Qty: {quantity}, Expiry: {expiry}, "
+                               f"Strikes: {long_put_strike}/{short_put_strike}/{short_call_strike}/{long_call_strike}")
+                
+            return trade
+            
+        except Exception as e:
+            self.logger.error(f"Error closing iron condor: {e}")
+            return None
 
 
 # Simple test function

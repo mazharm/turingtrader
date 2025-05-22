@@ -26,3 +26,31 @@ day_start_offset_hours = 0.5
 # Stop trading this many hours before market close
 day_end_offset_hours = 0.5
 default_order_type = MKT
+
+[PostgreSQL]
+# PostgreSQL/TimescaleDB connection settings
+host = localhost
+port = 5432
+username = postgres
+password = 
+database = turingtrader
+use_timescaledb = True
+
+[Redis]
+# Redis connection settings
+host = localhost
+port = 6379
+password = 
+database = 0
+default_expiry = 3600
+
+[VolatilityHarvesting]
+# Enhanced Adaptive Volatility-Harvesting System settings
+iv_hv_ratio_threshold = 1.2
+min_iv_threshold = 25.0
+use_adaptive_thresholds = True
+strike_width_pct = 1.0
+target_short_delta = 0.3
+target_long_delta = 0.1
+min_dte = 14
+max_dte = 45
