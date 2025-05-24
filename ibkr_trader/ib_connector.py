@@ -674,6 +674,111 @@ class IBConnector:
         
         return bag
         
+    def close_vertical_spread(self,
+                        bag_contract: Bag,
+                        quantity: int,
+                        limit_price: Optional[float] = None,
+                        action: str = 'BUY',  # 'BUY' to close a short spread, 'SELL' to close a long spread
+                        max_attempts: int = 3,
+                        price_increment_pct: float = 5.0
+                        ) -> Any:
+        """
+        Close a vertical spread position by submitting an opposing order.
+        
+        Args:
+            bag_contract: The qualified Bag contract of the vertical spread to close
+            quantity: Number of spreads to close
+            limit_price: Limit price for closing. For a short spread (credit spread), this is the debit to pay
+            action: Order action ('BUY' to close a short spread, 'SELL' to close a long spread)
+            max_attempts: Maximum number of attempts to fill the order
+            price_increment_pct: Percentage to increase the limit price by on each retry
+            
+        Returns:
+            Trade object if successful, None otherwise
+        """
+        if not self.check_connection():
+            return None
+            
+        try:
+            if limit_price is None or limit_price <= 0:
+                self.logger.warning("No valid limit price provided for closing vertical spread. Using market order.")
+                order = MarketOrder(action, quantity)
+                
+                # Submit market order
+                trade = self.ib.placeOrder(bag_contract, order)
+                
+                self.logger.info(f"Market order submitted to close vertical spread: {action} {quantity} {bag_contract.symbol}")
+                
+                # Wait for order to be acknowledged
+                timeout = time.time() + 10 
+                while time.time() < timeout:
+                    self.ib.sleep(0.5)
+                    if trade.isDone():
+                        break
+                
+                return trade
+            
+            # For limit orders, implement price improvement with multiple attempts
+            filled = False
+            attempt = 1
+            current_limit = limit_price
+            last_trade = None
+            
+            while not filled and attempt <= max_attempts:
+                # Create a limit order with the current price
+                order = LimitOrder(action, quantity, current_limit)
+                order.tif = 'GTC'  # Good Till Cancelled
+                
+                # Submit the order
+                trade = self.ib.placeOrder(bag_contract, order)
+                last_trade = trade
+                
+                self.logger.info(f"Limit order attempt {attempt}/{max_attempts} to close vertical spread: "
+                               f"{action} {quantity} {bag_contract.symbol} @ ${current_limit:.2f}")
+                
+                # Wait for the order to potentially fill
+                wait_time = 5 if attempt < max_attempts else 10  # Wait longer on final attempt
+                timeout = time.time() + wait_time
+                
+                while time.time() < timeout:
+                    self.ib.sleep(0.5)
+                    if trade.orderStatus.status == 'Filled':
+                        filled = True
+                        self.logger.info(f"Vertical spread close order filled: {trade.orderStatus.filled} @ {trade.orderStatus.avgFillPrice}")
+                        break
+                
+                if filled:
+                    break
+                
+                # If not filled and not the last attempt, cancel and retry with higher price
+                if attempt < max_attempts:
+                    self.ib.cancelOrder(order)
+                    
+                    # For BUY orders (closing a short spread), increase the price
+                    # For SELL orders (closing a long spread), decrease the price
+                    if action == 'BUY':
+                        # Increase the limit price by the specified percentage
+                        price_increment = current_limit * (price_increment_pct / 100.0)
+                        current_limit += price_increment
+                    else:  # 'SELL'
+                        # Decrease the limit price by the specified percentage
+                        price_decrement = current_limit * (price_increment_pct / 100.0)
+                        current_limit -= price_decrement
+                    
+                    self.logger.info(f"Adjusting limit price to ${current_limit:.2f} for next attempt")
+                
+                attempt += 1
+            
+            # If we couldn't fill after all attempts, return the last trade
+            if not filled:
+                self.logger.warning(f"Failed to fill vertical spread close order after {max_attempts} attempts")
+            
+            return last_trade
+                
+        except Exception as e:
+            self.logger.error(f"Error closing vertical spread: {e}", exc_info=True)
+            return None
+
     def submit_iron_condor_order(self,
                                symbol: str,
                                expiry: str,
@@ -763,7 +868,155 @@ class IBConnector:
             self.logger.error(f"Error submitting iron condor order: {e}", exc_info=True)
             return None
             
-    def close_iron_condor(self,
+    def submit_vertical_spread_order(self,
+                            symbol: str,
+                            expiry: str,
+                            short_strike: float,
+                            long_strike: float,
+                            right: str,  # 'C' for call, 'P' for put
+                            quantity: int,
+                            action: str = 'SELL',  # 'SELL' for credit spreads, 'BUY' for debit spreads
+                            limit_price: Optional[float] = None,
+                            exchange: str = 'SMART',
+                            currency: str = 'USD') -> Any:
+        """
+        Submit a vertical spread order.
+        
+        Args:
+            symbol: Underlying symbol
+            expiry: Option expiry date in YYYYMMDD format
+            short_strike: Strike price for short leg
+            long_strike: Strike price for long leg
+            right: Option type ('C' for call, 'P' for put)
+            quantity: Number of spreads
+            action: 'SELL' for credit spreads (bull put, bear call), 'BUY' for debit spreads
+            limit_price: Limit price for the spread. For credit spreads, this is the net credit desired.
+            exchange: Exchange name
+            currency: Currency code
+            
+        Returns:
+            Trade object if successful, None otherwise
+        """
+        if not self.check_connection():
+            return None
+            
+        try:
+            # Create spread contract
+            bag_contract = Contract()
+            bag_contract.symbol = symbol
+            bag_contract.secType = 'BAG'
+            bag_contract.currency = currency
+            bag_contract.exchange = exchange
+            
+            # Create combo legs based on spread type
+            legs = []
+            
+            # Determine spread configuration based on option type and strikes
+            if right == 'C':  # Call spread
+                if long_strike > short_strike:  # Bear Call Spread (short lower strike, long higher strike)
+                    # Short leg (sell call)
+                    legs.append(ComboLeg(
+                        conId=0,  # Will be filled in by IB
+                        ratio=1,
+                        action='SELL',
+                        exchange=exchange,
+                        openClose=0,  # 0 for open
+                        designatedLocation='',
+                        exemptCode=-1
+                    ))
+                    
+                    # Long leg (buy call)
+                    legs.append(ComboLeg(
+                        conId=0,  # Will be filled in by IB
+                        ratio=1,
+                        action='BUY',
+                        exchange=exchange,
+                        openClose=0,  # 0 for open
+                        designatedLocation='',
+                        exemptCode=-1
+                    ))
+                else:
+                    self.logger.error("Invalid call spread configuration: long_strike must be greater than short_strike for bear call spread")
+                    return None
+                    
+            elif right == 'P':  # Put spread
+                if short_strike > long_strike:  # Bull Put Spread (short higher strike, long lower strike)
+                    # Short leg (sell put)
+                    legs.append(ComboLeg(
+                        conId=0,  # Will be filled in by IB
+                        ratio=1,
+                        action='SELL',
+                        exchange=exchange,
+                        openClose=0,  # 0 for open
+                        designatedLocation='',
+                        exemptCode=-1
+                    ))
+                    
+                    # Long leg (buy put)
+                    legs.append(ComboLeg(
+                        conId=0,  # Will be filled in by IB
+                        ratio=1,
+                        action='BUY',
+                        exchange=exchange,
+                        openClose=0,  # 0 for open
+                        designatedLocation='',
+                        exemptCode=-1
+                    ))
+                else:
+                    self.logger.error("Invalid put spread configuration: short_strike must be greater than long_strike for bull put spread")
+                    return None
+            else:
+                self.logger.error(f"Invalid option type: {right}, must be 'C' or 'P'")
+                return None
+                
+            # Create option contracts for each leg
+            if right == 'C':
+                # For bear call spread
+                short_contract = Option(symbol, expiry, short_strike, right, exchange, tradingClass=symbol)
+                long_contract = Option(symbol, expiry, long_strike, right, exchange, tradingClass=symbol)
+            else:
+                # For bull put spread
+                short_contract = Option(symbol, expiry, short_strike, right, exchange, tradingClass=symbol)
+                long_contract = Option(symbol, expiry, long_strike, right, exchange, tradingClass=symbol)
+                
+            # Qualify the contracts to get the conId
+            self.ib.qualifyContracts(short_contract, long_contract)
+            
+            # Set conIds in combo legs
+            legs[0].conId = short_contract.conId
+            legs[1].conId = long_contract.conId
+            
+            # Set legs in bag contract
+            bag_contract.comboLegs = legs
+            
+            # Create order
+            if limit_price is not None:
+                if limit_price <= 0 and action == 'SELL':
+                    self.logger.warning("Limit price for credit spread must be positive")
+                    limit_price = abs(limit_price)
+                order = LimitOrder(action, quantity, limit_price)
+                order.tif = 'GTC'  # Good Till Cancelled
+            else:
+                self.logger.warning("Submitting vertical spread as Market Order (risky)")
+                order = MarketOrder(action, quantity)
+                
+            # Submit order
+            trade = self.ib.placeOrder(bag_contract, order)
+            
+            self.logger.info(f"Vertical spread order submitted: {action} {quantity} {symbol} {right} spread @ {short_strike}/{long_strike}")
+            
+            # Wait for acknowledgement
+            timeout = time.time() + 10
+            while time.time() < timeout:
+                self.ib.sleep(0.5)
+                if trade.isDone():
+                    break
+                    
+            return trade
+            
+        except Exception as e:
+            self.logger.error(f"Error submitting vertical spread order: {e}", exc_info=True)
+            return None
                         bag_contract: Bag, # Pass the qualified Bag contract of the open position
                         quantity: int,
                         limit_price: Optional[float] = None, # This is the NET DEBIT to pay
