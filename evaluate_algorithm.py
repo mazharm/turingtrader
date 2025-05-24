@@ -24,6 +24,7 @@ from historical_data.data_fetcher import HistoricalDataFetcher
 from backtesting.performance_analyzer import PerformanceAnalyzer
 # Import mock data for testing
 from backtesting.mock_data import MockDataFetcher
+from backtesting.realistic_mock_data import RealisticMockDataFetcher
 
 
 def parse_arguments():
@@ -66,6 +67,13 @@ def parse_arguments():
         '--test-mode',
         action='store_true',
         help='Run with mock data for testing purposes'
+    )
+    
+    # Force refreshing data
+    parser.add_argument(
+        '--refresh-data',
+        action='store_true',
+        help='Force refresh of historical data (ignore cache)'
     )
     
     # Logging
@@ -168,11 +176,46 @@ def evaluate_algorithm(args):
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Create data fetcher - use MockDataFetcher in test mode, or HistoricalDataFetcher otherwise
+    if args.test_mode:
+        data_fetcher = MockDataFetcher()
+        logging.warning("Using MOCK data for backtesting. Results will NOT reflect real market performance.")
+    else:
+        data_dir = os.path.join(os.getcwd(), 'data')
+        logging.info(f"Using REAL historical data from Yahoo Finance. Data will be cached in {data_dir}")
+        
+        # Clear cache if refresh data is requested
+        if args.refresh_data:
+            logging.info("Refreshing historical data - ignoring cache")
+            # Create a data fetcher and clear its cache
+            temp_fetcher = HistoricalDataFetcher(data_dir=data_dir)
+            temp_fetcher.clear_cache()
+        
+        # Create the data fetcher with the appropriate cache setting
+        data_fetcher = HistoricalDataFetcher(data_dir=data_dir)
+        
+        # Test if we can fetch data from Yahoo Finance
+        try:
+            spy_test = data_fetcher.fetch_data('SPY', 
+                                             (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
+                                             datetime.now().strftime('%Y-%m-%d'),
+                                             use_cache=False)
+            if spy_test.empty:
+                raise Exception("No data returned from Yahoo Finance")
+                
+        except Exception as e:
+            logging.warning(f"Failed to connect to Yahoo Finance: {e}")
+            logging.warning("Falling back to REALISTIC MOCK data. This data simulates real market behavior but is not actual historical data.")
+            data_fetcher = RealisticMockDataFetcher(data_dir=data_dir)
+            # Clear mock cache if refresh data is requested
+            if args.refresh_data:
+                data_fetcher.clear_cache()
+    
     # Create backtest engine
     engine = BacktestEngine(
         config=config,
         initial_balance=args.initial_investment,
-        data_fetcher=MockDataFetcher() if args.test_mode else None
+        data_fetcher=data_fetcher
     )
     
     # Define risk levels (1-10)
@@ -186,7 +229,8 @@ def evaluate_algorithm(args):
         results = engine.run_backtest(
             start_date=start_date,
             end_date=end_date,
-            risk_level=risk_level
+            risk_level=risk_level,
+            use_cache=not args.refresh_data
         )
         
         # Store results
@@ -229,6 +273,18 @@ def evaluate_algorithm(args):
     print("\n=== ALGORITHM EVALUATION SUMMARY ===")
     print(f"Evaluation Period: {start_date} to {end_date}")
     print(f"Initial Investment: ${args.initial_investment:,.2f}")
+    
+    # Print information about data source
+    if isinstance(data_fetcher, RealisticMockDataFetcher):
+        print("\nNOTE: Using REALISTIC MOCK data for backtesting.")
+        print("This data simulates real market behavior but is not actual historical data.")
+        print("For accurate production results, ensure that Yahoo Finance data is accessible.")
+    elif isinstance(data_fetcher, MockDataFetcher):
+        print("\nWARNING: Using SIMPLIFIED MOCK data for testing purposes only.")
+        print("Results do NOT represent real market performance.")
+    else:
+        print("\nUsing REAL historical market data from Yahoo Finance.")
+    
     print("\nBest Performance by Risk Level:")
     
     if 'optimal_risk_level' in comparison:
@@ -240,6 +296,27 @@ def evaluate_algorithm(args):
               f"(Return: {comparison['total_returns'][comparison['risk_levels'].index(comparison['best_return_risk_level'])]:,.2f}%)")
     
     print(f"\nResults saved to: {args.output_dir}")
+    
+    # Print summary performance table
+    print("\nPerformance Summary Across Risk Levels:")
+    print("------------------------------------------------------")
+    print("Risk | Return (%) | Max DD (%) | Sharpe | Trades | Win %")
+    print("------------------------------------------------------")
+    
+    for risk_level in range(1, 11):
+        if risk_level in results_by_risk:
+            result = results_by_risk[risk_level]
+            total_return = result.get('total_return_pct', 0)
+            max_drawdown = result.get('max_drawdown_pct', 0)
+            sharpe = result.get('sharpe_ratio', 0)
+            trades = result.get('total_trades', 0)
+            win_rate = result.get('win_rate', 0) * 100
+            
+            print(f"{risk_level:4d} | {total_return:10.2f} | {max_drawdown:10.2f} | {sharpe:6.2f} | {trades:6d} | {win_rate:5.1f}")
+    
+    print("------------------------------------------------------")
+    print("NOTE: Negative values for Max DD represent drawdowns (losses).")
+    print("      Higher Sharpe ratios indicate better risk-adjusted returns.")
     
     return 0
 
