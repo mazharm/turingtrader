@@ -296,16 +296,28 @@ class TuringTrader:
                 long_call_strike = trade_decision.get('long_call_strike')
                 long_put_strike = trade_decision.get('long_put_strike')
                 quantity = trade_decision.get('quantity')
-                net_credit_estimate = trade_decision.get('net_credit') # Estimated credit
-
-                # For Iron Condors, we are selling the spread, so we expect a credit.
-                # The IB API for BAG orders might require a positive limit price for a credit.
-                # We place a limit order at the estimated net credit.
-                # A market order for complex spreads is often not advisable due to slippage.
-                # If net_credit_estimate is positive, it's a credit.
-                # IB's limit orders for combos: BUY for a debit, SELL for a credit.
-                # Since we are *receiving* a credit, we are *selling* the condor structure.
+                net_credit_estimate = trade_decision.get('net_credit')  # Estimated credit
                 
+                # Additional checks before execution
+                if quantity <= 0:
+                    self.logger.error(f"Invalid quantity for iron condor trade: {quantity}")
+                    return {'executed': False, 'reason': 'invalid_quantity'}
+                
+                if net_credit_estimate <= 0:
+                    self.logger.error(f"Invalid credit estimate for iron condor trade: {net_credit_estimate}")
+                    return {'executed': False, 'reason': 'invalid_credit_estimate'}
+                
+                # Calculate the minimum acceptable credit (95% of estimate)
+                # This ensures we don't execute at significantly worse prices than expected
+                min_acceptable_credit = net_credit_estimate * 0.95
+                
+                # For better pricing: we start with a limit order slightly above our estimate
+                # to increase fill probability while still getting a good price
+                initial_limit_price = net_credit_estimate * 1.02  # Start with 102% of estimate
+                
+                self.logger.info(f"Attempting iron condor execution with initial limit price: ${initial_limit_price:.2f} (estimate: ${net_credit_estimate:.2f})")
+                
+                # First attempt at submitting the order
                 trade = self.ib_connector.submit_iron_condor_order(
                     symbol=symbol,
                     expiry=expiry,
@@ -314,44 +326,91 @@ class TuringTrader:
                     long_put_strike=long_put_strike,
                     long_call_strike=long_call_strike,
                     quantity=quantity,
-                    # For a credit, the price is positive. We are SELLING the condor.
-                    # The submit_iron_condor_order in ib_connector uses 'BUY' for LimitOrder by default
-                    # This needs to be 'SELL' if we expect a credit.
-                    # Let's assume submit_iron_condor_order handles the action based on price (e.g. positive for credit = SELL)
-                    # Or, more explicitly, we might need to adjust ib_connector or pass 'SELL' action here.
-                    # For now, assuming ib_connector's submit_iron_condor_order is set up to sell for a credit.
-                    # If it uses a BUY order with a positive price, that would be a DEBIT.
-                    # Let's assume the `submit_iron_condor_order` is designed to take the net_credit as the limit price
-                    # and handles the BUY/SELL action appropriately (e.g. if price > 0, it's a credit, so SELL action).
-                    # Re-checking ib_connector.py: submit_iron_condor_order uses LimitOrder('BUY', ...)
-                    # This is problematic if we want a credit. A BUY limit order for a spread means we are willing to PAY up to limit_price.
-                    # To receive a credit, we need a SELL limit order.
-                    # Fix: Change the approach to explicitly use 'SELL' action for credit trades in the BAG order
-                    # The limit price should be positive for a credit when using SELL
                     action="SELL",  # SELL to receive credit for the iron condor
-                    limit_price=abs(net_credit_estimate)  # Price must be positive for IB limit orders
+                    limit_price=initial_limit_price  # Start with slightly higher price
                 )
+                
+                # Wait for the initial order to potentially fill
+                filled = False
+                max_attempts = 3
+                current_attempt = 1
+                
+                while not filled and current_attempt <= max_attempts:
+                    # Check if the order was filled
+                    if trade and trade.orderStatus and trade.orderStatus.status == 'Filled':
+                        filled = True
+                        self.logger.info(f"Iron condor filled at attempt {current_attempt} with price ${trade.orderStatus.avgFillPrice:.2f}")
+                        break
+                    
+                    # If not filled after waiting, adjust the price
+                    if trade and trade.orderStatus:
+                        # Cancel the existing order
+                        self.ib_connector.ib.cancelOrder(trade.order)
+                        self.logger.info(f"Canceling unfilled order, attempt {current_attempt}")
+                        
+                        # Adjust the limit price down
+                        adjusted_limit_price = net_credit_estimate * (1.0 - 0.02 * current_attempt)
+                        
+                        # Don't go below our minimum acceptable price
+                        if adjusted_limit_price < min_acceptable_credit:
+                            self.logger.warning(f"Adjusted price ${adjusted_limit_price:.2f} would be below minimum acceptable ${min_acceptable_credit:.2f}")
+                            adjusted_limit_price = min_acceptable_credit
+                        
+                        self.logger.info(f"Retrying with adjusted limit price: ${adjusted_limit_price:.2f}")
+                        
+                        # Submit a new order with the adjusted price
+                        trade = self.ib_connector.submit_iron_condor_order(
+                            symbol=symbol,
+                            expiry=expiry,
+                            short_put_strike=short_put_strike,
+                            short_call_strike=short_call_strike,
+                            long_put_strike=long_put_strike,
+                            long_call_strike=long_call_strike,
+                            quantity=quantity,
+                            action="SELL",
+                            limit_price=adjusted_limit_price
+                        )
+                    
+                    current_attempt += 1
+                    
+                    # Wait a short time before checking again (if not the last attempt)
+                    if current_attempt <= max_attempts:
+                        time.sleep(3)  # Wait 3 seconds before checking or retrying
+                
+                # If we couldn't fill the order after all attempts
+                if not filled:
+                    self.logger.warning("Failed to fill iron condor order after multiple attempts")
+                    
+                    # Cancel the last unfilled order
+                    if trade and trade.order:
+                        self.ib_connector.ib.cancelOrder(trade.order)
+                    
+                    return {'executed': False, 'reason': 'order_not_filled_after_retries'}
+                
+                # If we got here, the order was filled
+                if not trade or not trade.orderStatus:
+                    self.logger.error(f"Order status unavailable for filled iron condor")
+                    return {'executed': False, 'reason': 'order_status_unavailable'}
 
-                if trade is None or not trade.orderStatus:
-                    self.logger.error(f"Failed to execute iron condor trade for {symbol}")
-                    return {'executed': False, 'reason': 'iron_condor_order_failed_or_no_status'}
-
-                self.day_trade_count += 1 # Counts as one complex trade
+                self.day_trade_count += 1  # Counts as one complex trade
                 self.last_trade_time = datetime.now()
 
-                avg_fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus else 0.0
-                if not avg_fill_price: # Fallback
-                    avg_fill_price = net_credit_estimate # Use estimate if fill not available
+                avg_fill_price = trade.orderStatus.avgFillPrice
+                
+                # Verify we got a reasonable price
+                if avg_fill_price < min_acceptable_credit:
+                    self.logger.warning(f"Iron condor filled at ${avg_fill_price:.2f}, below minimum acceptable ${min_acceptable_credit:.2f}")
 
                 # Construct a symbol for the condor
                 condor_symbol = f"{symbol}_IC_{expiry}_{long_put_strike:.0f}P_{short_put_strike:.0f}P_{short_call_strike:.0f}C_{long_call_strike:.0f}C"
                 
+                # Register the position with the risk manager
                 self.risk_manager.add_position(
                     symbol=condor_symbol,
                     quantity=quantity,
-                    entry_price=avg_fill_price, # This is the net credit received per spread
+                    entry_price=avg_fill_price,  # This is the net credit received per spread
                     position_type='iron_condor',
-                    option_data={ # Store all relevant details for the condor
+                    option_data={  # Store all relevant details for the condor
                         'underlying': symbol,
                         'expiry': expiry,
                         'short_put_strike': short_put_strike,
@@ -359,18 +418,23 @@ class TuringTrader:
                         'long_put_strike': long_put_strike,
                         'long_call_strike': long_call_strike,
                         'net_credit_received': avg_fill_price,
-                        'max_risk_per_spread': trade_decision.get('max_risk'), # From options_strategy
-                        'contract': trade.contract # The BAG contract
+                        'max_risk_per_spread': trade_decision.get('max_risk_per_spread'),  # From options_strategy
+                        'contract': trade.contract,  # The BAG contract
+                        'estimated_credit': net_credit_estimate,  # Store original estimate for analysis
+                        'fill_quality': (avg_fill_price / net_credit_estimate) * 100  # Percentage of estimate
                     }
                 )
 
-                self.logger.info(f"Executed Iron Condor: {quantity} {condor_symbol} for a credit of {avg_fill_price:.2f} per spread")
+                self.logger.info(f"Executed Iron Condor: {quantity} {condor_symbol} for a credit of ${avg_fill_price:.2f} per spread")
+                self.logger.info(f"Fill quality: {(avg_fill_price / net_credit_estimate) * 100:.1f}% of estimated credit")
 
                 return {
                     'executed': True,
                     'trade_id': trade.order.orderId if trade.order else None,
                     'avg_price_credit': avg_fill_price,
                     'quantity': quantity,
+                    'symbol': condor_symbol,
+                    'fill_quality_pct': (avg_fill_price / net_credit_estimate) * 100,
                     'details': trade_decision 
                 }
 
