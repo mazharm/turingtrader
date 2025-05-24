@@ -90,20 +90,34 @@ class RiskParameters:
             
         # Scale parameters according to risk level
         self.risk_level = level
-        # Lower risk means higher volatility threshold for entry
-        self.min_volatility_threshold = 10 + (10 - level) * 2
-        # Lower risk means lower daily risk
-        self.max_daily_risk_pct = level * 0.5
-        # Lower risk means smaller position size
-        self.max_position_size_pct = 5 + level * 3  
-        # Lower risk means lower delta exposure
-        self.max_delta_exposure = 10 + level * 8
-        # Lower risk means tighter stop loss
-        self.stop_loss_pct = 5 + level * 2
-        # Lower risk means lower but more achievable target profit
-        self.target_profit_pct = 10 + level * 3
-        # Lower risk means requiring larger volatility changes to trade
-        self.min_volatility_change = 5 - (level * 0.4)
+        
+        # Lower risk means higher volatility threshold for entry - adjusted for better entry points
+        self.min_volatility_threshold = 18 + (10 - level) * 1.5
+        
+        # Lower risk means lower daily risk - more conservative daily risk limits
+        self.max_daily_risk_pct = 0.5 + level * 0.3
+        
+        # Lower risk means smaller position size - scaled for more appropriate sizing
+        self.max_position_size_pct = 3 + level * 2  
+        
+        # Lower risk means lower delta exposure - adjusted for better delta risk control
+        self.max_delta_exposure = 5 + level * 5
+        
+        # Lower risk means tighter stop loss - improved to prevent larger drawdowns
+        self.stop_loss_pct = 10 + level * 1.5
+        
+        # Lower risk means lower but more achievable target profit - more realistic targets
+        self.target_profit_pct = 15 + level * 2
+        
+        # Lower risk means requiring larger volatility changes to trade - more selective entry
+        self.min_volatility_change = 3 - (level * 0.2)
+        
+        # Iron Condor specific adjustments
+        # More conservative stop loss for lower risk levels
+        self.condor_stop_loss_factor_of_max_risk = 30 + (level * 3)
+        
+        # More achievable profit targets for lower risk levels
+        self.condor_profit_target_factor_of_credit = 60 + (10 - level) * 3
 
 
 @dataclass

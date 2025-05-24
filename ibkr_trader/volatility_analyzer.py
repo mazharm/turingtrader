@@ -305,6 +305,42 @@ class VolatilityAnalyzer:
                 'error': str(e)
             }
     
+    def _calculate_opportunity_score(self, iv: float, days_to_expiry: int, volume: int, bid: float) -> float:
+        """
+        Calculate a quality score for an option opportunity.
+        Higher score means better opportunity.
+        
+        Args:
+            iv: Implied volatility (decimal)
+            days_to_expiry: Days to expiration
+            volume: Trading volume
+            bid: Bid price
+            
+        Returns:
+            Quality score (0-100)
+        """
+        # IV score (higher IV is better, but with diminishing returns)
+        iv_pct = iv * 100  # Convert to percentage
+        iv_score = min(50, iv_pct * 1.5)  # Cap at 50
+        
+        # Days to expiry score (30-45 days is optimal for theta decay)
+        dte_score = 0
+        if 25 <= days_to_expiry <= 50:
+            dte_score = 30  # Optimal range
+        elif 15 <= days_to_expiry < 25 or 50 < days_to_expiry <= 60:
+            dte_score = 20  # Good range
+        else:
+            dte_score = 10  # Acceptable range
+            
+        # Volume score (higher volume means better liquidity)
+        volume_score = min(10, volume / 100)
+        
+        # Bid price score (higher premium is better)
+        bid_score = min(10, bid * 5)
+        
+        # Total score
+        return iv_score + dte_score + volume_score + bid_score
+        
     def analyze_option_chain(self, chain_data: Dict) -> Dict:
         """
         Analyze option chain to find implied volatility and trading opportunities.
@@ -348,10 +384,21 @@ class VolatilityAnalyzer:
                 days_to_expiry = expiry_data.get('days_to_expiry', 0)
                 
                 # Find potential opportunities (high IV, reasonable time to expiry)
-                if 5 <= days_to_expiry <= 45:
+                # Use 20-60 days for better spread of opportunities while still focusing on optimal theta decay
+                if 20 <= days_to_expiry <= 60:
+                    # Focus on opportunities with higher implied volatility
+                    # Adjust the min_volatility_threshold to ensure we're targeting higher IV options
+                    min_iv_threshold = self.min_volatility_threshold / 100
+                    
+                    # For calls: Only consider those with enough premium and volume
                     for strike, option in calls.items():
                         iv = option.get('iv', 0)
-                        if iv > self.min_volatility_threshold / 100:
+                        bid = option.get('bid', 0)
+                        volume = option.get('volume', 0) if option.get('volume') is not None else 0
+                        
+                        # Higher threshold for IV to ensure we're capturing true high-volatility opportunities
+                        # Also check if there's reasonable bid price and volume
+                        if iv > min_iv_threshold and bid >= 0.1 and volume >= 10:
                             result['opportunities'].append({
                                 'type': 'call',
                                 'expiry': expiry,
@@ -359,12 +406,18 @@ class VolatilityAnalyzer:
                                 'iv': iv,
                                 'days_to_expiry': days_to_expiry,
                                 'bid': option.get('bid', 0),
-                                'ask': option.get('ask', 0)
+                                'ask': option.get('ask', 0),
+                                'volume': volume,
+                                'quality_score': self._calculate_opportunity_score(iv, days_to_expiry, volume, bid)
                             })
                     
+                    # For puts: Similar criteria as calls
                     for strike, option in puts.items():
                         iv = option.get('iv', 0)
-                        if iv > self.min_volatility_threshold / 100:
+                        bid = option.get('bid', 0)
+                        volume = option.get('volume', 0) if option.get('volume') is not None else 0
+                        
+                        if iv > min_iv_threshold and bid >= 0.1 and volume >= 10:
                             result['opportunities'].append({
                                 'type': 'put',
                                 'expiry': expiry,
@@ -372,7 +425,9 @@ class VolatilityAnalyzer:
                                 'iv': iv,
                                 'days_to_expiry': days_to_expiry,
                                 'bid': option.get('bid', 0),
-                                'ask': option.get('ask', 0)
+                                'ask': option.get('ask', 0),
+                                'volume': volume,
+                                'quality_score': self._calculate_opportunity_score(iv, days_to_expiry, volume, bid)
                             })
             
             # Calculate overall average IVs
@@ -386,8 +441,8 @@ class VolatilityAnalyzer:
             if all_call_ivs and all_put_ivs:
                 result['skew'] = result['avg_iv_puts'] / result['avg_iv_calls'] - 1.0
             
-            # Sort opportunities by IV (highest first)
-            result['opportunities'].sort(key=lambda x: x['iv'], reverse=True)
+            # Sort opportunities by quality score (best first) instead of just IV
+            result['opportunities'].sort(key=lambda x: x.get('quality_score', 0), reverse=True)
             
             return result
             

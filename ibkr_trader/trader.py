@@ -326,11 +326,10 @@ class TuringTrader:
                     # Re-checking ib_connector.py: submit_iron_condor_order uses LimitOrder('BUY', ...)
                     # This is problematic if we want a credit. A BUY limit order for a spread means we are willing to PAY up to limit_price.
                     # To receive a credit, we need a SELL limit order.
-                    # This will require modification in ib_connector.py or a new method.
-
-                    # TEMPORARY: For now, let's assume we will adjust ib_connector later or this is a placeholder.
-                    # The crucial part is that the 'action' for the LimitOrder for the BAG should be 'SELL' to receive a credit.
-                    limit_price=abs(net_credit_estimate) # Price must be positive for IB limit orders
+                    # Fix: Change the approach to explicitly use 'SELL' action for credit trades in the BAG order
+                    # The limit price should be positive for a credit when using SELL
+                    action="SELL",  # SELL to receive credit for the iron condor
+                    limit_price=abs(net_credit_estimate)  # Price must be positive for IB limit orders
                 )
 
                 if trade is None or not trade.orderStatus:
