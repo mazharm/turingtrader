@@ -27,7 +27,8 @@ def main():
         'period': 365,
         'output_dir': './example_evaluations/basic',
         'config': None,
-        'log_level': 'INFO'
+        'log_level': 'INFO',
+        'test_mode': True  # Use mock data for testing
     })
     
     evaluate_algorithm(args1)
@@ -39,7 +40,8 @@ def main():
         'period': 180,
         'output_dir': './example_evaluations/custom',
         'config': None,
-        'log_level': 'INFO'
+        'log_level': 'INFO',
+        'test_mode': True  # Use mock data for testing
     })
     
     evaluate_algorithm(args2)
@@ -68,7 +70,8 @@ def main():
             'period': days,
             'output_dir': f'./example_evaluations/comparison/{period_name}',
             'config': None,
-            'log_level': 'INFO'
+            'log_level': 'INFO',
+            'test_mode': True  # Use mock data for testing
         })
         
         evaluate_algorithm(period_args)

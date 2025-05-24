@@ -59,6 +59,9 @@ python evaluate_algorithm.py
 # Custom evaluation period and investment amount
 python evaluate_algorithm.py --period 180 --initial-investment 250000 --output-dir ./my_evaluation
 
+# Test mode with mock data (useful for development and testing)
+python evaluate_algorithm.py --test-mode --period 30
+
 # Full options list
 python evaluate_algorithm.py --help
 ```

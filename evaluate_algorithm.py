@@ -22,6 +22,8 @@ from backtesting.backtest_engine import BacktestEngine
 from utils.reporting import generate_report, generate_multi_risk_report, export_multi_risk_summary
 from historical_data.data_fetcher import HistoricalDataFetcher
 from backtesting.performance_analyzer import PerformanceAnalyzer
+# Import mock data for testing
+from backtesting.mock_data import MockDataFetcher
 
 
 def parse_arguments():
@@ -57,6 +59,13 @@ def parse_arguments():
         '--config',
         type=str,
         help='Path to configuration file'
+    )
+    
+    # Testing mode
+    parser.add_argument(
+        '--test-mode',
+        action='store_true',
+        help='Run with mock data for testing purposes'
     )
     
     # Logging
@@ -162,7 +171,8 @@ def evaluate_algorithm(args):
     # Create backtest engine
     engine = BacktestEngine(
         config=config,
-        initial_balance=args.initial_investment
+        initial_balance=args.initial_investment,
+        data_fetcher=MockDataFetcher() if args.test_mode else None
     )
     
     # Define risk levels (1-10)
