@@ -514,27 +514,42 @@ class VolatilityAnalyzer:
             
         # Update IV threshold based on VIX
         # In higher volatility environments, we need higher IV for signals
-        if current_vix > 30:
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.3
+        # Made more conservative in high volatility environments
+        if current_vix > 35:
+            # Extreme volatility - significantly increase threshold
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.5
+        elif current_vix > 30:
+            # Very high volatility - substantially increase threshold
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.4
         elif current_vix > 25:
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.2
+            # High volatility - moderately increase threshold
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.25
         elif current_vix > 20:
+            # Above average volatility - slightly increase threshold
             self.adaptive_iv_threshold = self.min_iv_threshold * 1.1
         elif current_vix < 15:
+            # Low volatility - slightly decrease threshold
             self.adaptive_iv_threshold = self.min_iv_threshold * 0.9
         else:
+            # Normal volatility - use standard threshold
             self.adaptive_iv_threshold = self.min_iv_threshold
         
         # Update IV/HV ratio threshold based on VIX volatility
-        # In more volatile VIX environments, we can lower our ratio threshold
+        # In more volatile VIX environments, be more selective by raising threshold
         if len(self.vix_history) >= 5:
             vix_std = np.std(self.vix_history[-5:])
-            if vix_std > 2.0:  # Very volatile VIX
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.85
-            elif vix_std > 1.0:  # Moderately volatile VIX
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.95
-            elif vix_std < 0.5:  # Very stable VIX
+            if vix_std > 3.0:  # Extremely volatile VIX
+                # Be more selective in extreme volatility
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.2
+            elif vix_std > 2.0:  # Very volatile VIX
+                # Be more selective in high volatility
                 self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.1
+            elif vix_std > 1.0:  # Moderately volatile VIX
+                # Maintain normal selectivity
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
+            elif vix_std < 0.5:  # Very stable VIX
+                # Be slightly less selective in stable markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.95
             else:
                 self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
     
@@ -612,12 +627,18 @@ class VolatilityAnalyzer:
                 self.iv_hv_ratios = self.iv_hv_ratios[-20:]
             
             # Determine signal based on IV/HV ratio and other factors
+            # Added additional check for minimum IV to ensure sufficiently high implied volatility
             if iv_hv_ratio >= self.adaptive_iv_hv_ratio and iv >= self.adaptive_iv_threshold:
                 # Check VIX state and trend
                 vix_signal = vix_analysis.get('signal', 'none')
+                volatility_state = vix_analysis.get('volatility_state', 'unknown')
                 
-                if vix_signal in ['buy', 'strong_buy']:
-                    # Strong signal
+                # More conservative approach in extreme volatility states
+                if volatility_state == 'extreme' and iv_hv_ratio < self.adaptive_iv_hv_ratio * 1.3:
+                    # In extreme volatility, need much higher IV/HV ratio to generate signal
+                    result['signal'] = 'monitor'
+                elif vix_signal in ['buy', 'strong_buy']:
+                    # Strong signal - only if VIX suggests favorable conditions
                     result['signal'] = 'strong_volatility_harvest'
                     result['strategy'] = 'iron_condor'
                 elif vix_signal == 'hold' and iv_hv_ratio >= self.adaptive_iv_hv_ratio * 1.2:
