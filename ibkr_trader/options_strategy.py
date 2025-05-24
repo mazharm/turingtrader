@@ -645,20 +645,42 @@ class OptionsStrategy:
             self.index_symbol, vix_analysis, option_chain
         )
         
+        # More conservative position sizing
         position_size_multiplier = 0.0
         if vol_harvest_analysis['signal'] == 'strong_volatility_harvest':
-            position_size_multiplier = 1.0
+            position_size_multiplier = 0.8  # Reduced from 1.0
         elif vol_harvest_analysis['signal'] == 'volatility_harvest':
-            position_size_multiplier = 0.7
+            position_size_multiplier = 0.5  # Reduced from 0.7
         else:
-            position_size_multiplier = 0.5
+            position_size_multiplier = 0.3  # Reduced from 0.5
+        
+        # Additional check for return on risk - ensure adequate reward for the risk
+        if iron_condor['return_on_risk'] < 0.15:  # Minimum 15% return on risk
+            self.logger.info(f"Iron condor return on risk too low: {iron_condor['return_on_risk']:.2f}")
+            return {
+                'action': 'none',
+                'reason': 'insufficient_return_on_risk'
+            }
+            
+        # Additional check for minimum credit - ensure enough premium is collected
+        if iron_condor['net_credit'] < 0.2:  # Minimum $0.20 credit per spread
+            self.logger.info(f"Iron condor net credit too low: {iron_condor['net_credit']:.2f}")
+            return {
+                'action': 'none',
+                'reason': 'insufficient_credit'
+            }
         
         # Risk only what we're willing to lose (max risk * quantity)
-        max_risk_amount = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0) * position_size_multiplier
+        # More conservative risk allocation - additional 0.8 factor
+        max_risk_amount = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0) * position_size_multiplier * 0.8
         
         # Calculate quantity
         quantity = int(max_risk_amount / iron_condor['max_risk']) if iron_condor['max_risk'] > 0 else 1
         quantity = max(1, quantity)  # At least 1 contract
+        
+        # Additional cap on quantity based on account size
+        max_quantity_by_account = int(account_value * 0.005 / iron_condor['max_risk'])
+        quantity = min(quantity, max_quantity_by_account)
         
         # Build trade decision
         trade_decision = {

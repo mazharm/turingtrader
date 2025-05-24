@@ -91,33 +91,33 @@ class RiskParameters:
         # Scale parameters according to risk level
         self.risk_level = level
         
-        # Lower risk means higher volatility threshold for entry - adjusted for better entry points
-        self.min_volatility_threshold = 18 + (10 - level) * 1.5
+        # Lower risk means higher volatility threshold for entry - increased to be more selective
+        self.min_volatility_threshold = 20 + (10 - level) * 1.8
         
-        # Lower risk means lower daily risk - more conservative daily risk limits
-        self.max_daily_risk_pct = 0.5 + level * 0.3
+        # Lower risk means lower daily risk - made more conservative across all levels
+        self.max_daily_risk_pct = 0.4 + level * 0.25  # Reduced from 0.5 + level * 0.3
         
-        # Lower risk means smaller position size - scaled for more appropriate sizing
-        self.max_position_size_pct = 3 + level * 2  
+        # Lower risk means smaller position size - reduced for more appropriate sizing
+        self.max_position_size_pct = 2 + level * 1.5   # Reduced from 3 + level * 2
         
         # Lower risk means lower delta exposure - adjusted for better delta risk control
-        self.max_delta_exposure = 5 + level * 5
+        self.max_delta_exposure = 5 + level * 4  # Reduced from 5 + level * 5
         
         # Lower risk means tighter stop loss - improved to prevent larger drawdowns
-        self.stop_loss_pct = 10 + level * 1.5
+        self.stop_loss_pct = 8 + level * 1.2  # Reduced from 10 + level * 1.5
         
         # Lower risk means lower but more achievable target profit - more realistic targets
-        self.target_profit_pct = 15 + level * 2
+        self.target_profit_pct = 12 + level * 1.5  # Reduced from 15 + level * 2
         
         # Lower risk means requiring larger volatility changes to trade - more selective entry
-        self.min_volatility_change = 3 - (level * 0.2)
+        self.min_volatility_change = 3.5 - (level * 0.2)  # Increased from 3 - (level * 0.2)
         
         # Iron Condor specific adjustments
         # More conservative stop loss for lower risk levels
-        self.condor_stop_loss_factor_of_max_risk = 30 + (level * 3)
+        self.condor_stop_loss_factor_of_max_risk = 25 + (level * 2.5)  # Reduced from 30 + (level * 3)
         
-        # More achievable profit targets for lower risk levels
-        self.condor_profit_target_factor_of_credit = 60 + (10 - level) * 3
+        # More achievable profit targets for lower risk levels - take profits earlier
+        self.condor_profit_target_factor_of_credit = 65 + (10 - level) * 3  # Increased from 60 + (10 - level) * 3
 
 
 @dataclass
@@ -146,22 +146,27 @@ class TradingConfig:
 class VolatilityHarvestingConfig:
     """Configuration for the Adaptive Volatility-Harvesting System."""
     # IV/HV ratio threshold for signal generation
-    iv_hv_ratio_threshold: float = 1.2
+    # Increased to 1.3 for more selective entry points (balanced approach from volatility report)
+    iv_hv_ratio_threshold: float = 1.3
     
     # Minimum IV required for trade entry
+    # Maintained at 25.0 for more conservative approach
     min_iv_threshold: float = 25.0
     
     # Use adaptive thresholds based on market conditions
     use_adaptive_thresholds: bool = True
     
     # Range around calculated strikes for iron condor legs (percentage)
-    strike_width_pct: float = 1.0
+    # Increased from 1.0 to 5.0 for better protection (balanced approach from volatility report)
+    strike_width_pct: float = 5.0
     
     # Target delta for short options legs
+    # Maintained at 0.3 (balanced approach from volatility report)
     target_short_delta: float = 0.3
     
     # Target delta for long options legs
-    target_long_delta: float = 0.1
+    # Adjusted to be more conservative with wider protection
+    target_long_delta: float = 0.15
     
     # Default days to expiration range
     min_dte: int = 14
@@ -343,12 +348,12 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
     }
     
     config['VolatilityHarvesting'] = {
-        'iv_hv_ratio_threshold': '1.2',
+        'iv_hv_ratio_threshold': '1.3',
         'min_iv_threshold': '25.0',
         'use_adaptive_thresholds': 'True',
-        'strike_width_pct': '1.0',
+        'strike_width_pct': '5.0',
         'target_short_delta': '0.3',
-        'target_long_delta': '0.1',
+        'target_long_delta': '0.15',
         'min_dte': '14',
         'max_dte': '45'
     }
