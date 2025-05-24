@@ -24,6 +24,7 @@ from historical_data.data_fetcher import HistoricalDataFetcher
 from backtesting.performance_analyzer import PerformanceAnalyzer
 # Import mock data for testing
 from backtesting.mock_data import MockDataFetcher
+from backtesting.realistic_mock_data import RealisticMockDataFetcher
 
 
 def parse_arguments():
@@ -182,6 +183,7 @@ def evaluate_algorithm(args):
     else:
         data_dir = os.path.join(os.getcwd(), 'data')
         logging.info(f"Using REAL historical data from Yahoo Finance. Data will be cached in {data_dir}")
+        
         # Clear cache if refresh data is requested
         if args.refresh_data:
             logging.info("Refreshing historical data - ignoring cache")
@@ -191,6 +193,23 @@ def evaluate_algorithm(args):
         
         # Create the data fetcher with the appropriate cache setting
         data_fetcher = HistoricalDataFetcher(data_dir=data_dir)
+        
+        # Test if we can fetch data from Yahoo Finance
+        try:
+            spy_test = data_fetcher.fetch_data('SPY', 
+                                             (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
+                                             datetime.now().strftime('%Y-%m-%d'),
+                                             use_cache=False)
+            if spy_test.empty:
+                raise Exception("No data returned from Yahoo Finance")
+                
+        except Exception as e:
+            logging.warning(f"Failed to connect to Yahoo Finance: {e}")
+            logging.warning("Falling back to REALISTIC MOCK data. This data simulates real market behavior but is not actual historical data.")
+            data_fetcher = RealisticMockDataFetcher(data_dir=data_dir)
+            # Clear mock cache if refresh data is requested
+            if args.refresh_data:
+                data_fetcher.clear_cache()
     
     # Create backtest engine
     engine = BacktestEngine(
