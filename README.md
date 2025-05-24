@@ -48,6 +48,30 @@ python backtest.py --risk-level [1-10] --start-date YYYY-MM-DD --end-date YYYY-M
 python -m utils.reporting --output-dir ./reports
 ```
 
+### Algorithm Evaluation
+
+Evaluate the complete trading algorithm's performance across all risk levels using historical data:
+
+```bash
+# Evaluate with default settings (past year, $100k initial investment)
+python evaluate_algorithm.py
+
+# Custom evaluation period and investment amount
+python evaluate_algorithm.py --period 180 --initial-investment 250000 --output-dir ./my_evaluation
+
+# Test mode with mock data (useful for development and testing)
+python evaluate_algorithm.py --test-mode --period 30
+
+# Full options list
+python evaluate_algorithm.py --help
+```
+
+The evaluation generates:
+- Performance reports for each risk level (1-10)
+- Comparative analysis of all risk levels
+- Investment growth chart
+- Summary statistics in CSV format
+
 ## Project Structure
 
 - `ibkr_trader/`: Core trading components
