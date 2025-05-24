@@ -111,25 +111,25 @@ class RiskManager:
         if self.max_daily_risk_amount == 0.0:
             self.update_account_value(account_value)
             
-        # Base position size as percentage of max position size
-        base_size = self.max_position_size * vol_multiplier
+        # Base position size as percentage of max position size - reduced multiplier for safety
+        base_size = self.max_position_size * (vol_multiplier * 0.85)
         
-        # Adjust for volatility - more conservative scaling for high volatility
+        # Adjust for volatility - more conservative scaling for all volatility levels
         if volatility > 50:
-            vol_factor = 0.3  # Extremely high volatility - reduce position size drastically
+            vol_factor = 0.2  # Extremely high volatility - reduce position size drastically
         elif volatility > 40:
-            vol_factor = 0.4  # Very high volatility - reduce position size significantly
+            vol_factor = 0.3  # Very high volatility - reduce position size significantly
         elif volatility > 30:
-            vol_factor = 0.6  # Above average volatility - reduce position size moderately
+            vol_factor = 0.5  # Above average volatility - reduce position size moderately
         elif volatility > 20:
-            vol_factor = 0.8  # Normal volatility - slight reduction
+            vol_factor = 0.7  # Normal volatility - still apply moderate reduction
         elif volatility > 15:
-            vol_factor = 0.9  # Optimal volatility range - nearly full position size
+            vol_factor = 0.8  # Optimal volatility range - apply slight reduction
         else:
-            vol_factor = 0.7  # Low volatility - reduce position size as premiums are likely too small
+            vol_factor = 0.5  # Low volatility - reduce position size as premiums are likely too small
             
-        # Calculate dollar amount - add a more conservative cap to prevent excessively large positions
-        position_value = min(base_size * vol_factor, account_value * 0.10)  # Reduced from 0.15
+        # Calculate dollar amount - even more conservative cap to prevent large positions
+        position_value = min(base_size * vol_factor, account_value * 0.08)  # Reduced from 0.10
         
         # Convert to quantity
         quantity = int(position_value / price)
@@ -167,24 +167,23 @@ class RiskManager:
         if self.max_daily_risk_amount == 0.0:
             self.update_account_value(account_value)
             
-        # Base position value as percentage of max position size - reduced for more conservative sizing
-        base_size = (self.max_position_size * vol_multiplier) * 0.8  # Added 0.8 factor for additional safety
+        # Base position value as percentage of max position size - significantly reduced for safety
+        base_size = (self.max_position_size * vol_multiplier) * 0.7  # Reduced from 0.8
         
         # Improved delta-based adjustment with more conservative scaling
-        # Scale based on option delta to manage risk more effectively
         if abs_delta > 0.7:  # Deep ITM options
-            delta_factor = min(0.3, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.5
+            delta_factor = min(0.2, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.3
         elif abs_delta > 0.4:  # Moderate delta
-            delta_factor = min(0.5, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.7
+            delta_factor = min(0.3, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.5
         elif abs_delta > 0.2:  # Standard delta range for many strategies
-            delta_factor = min(0.7, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 1.0
+            delta_factor = min(0.5, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.7
         elif abs_delta > 0.05:  # Lower delta (OTM options)
-            delta_factor = min(0.6, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.8
+            delta_factor = min(0.4, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.6
         else:  # Very low delta (far OTM options)
-            delta_factor = 0.3  # Reduced from 0.4
+            delta_factor = 0.2  # Reduced from 0.3
             
-        # Calculate dollar amount with maximum position cap - more conservative cap
-        position_value = min(base_size * delta_factor, account_value * 0.07)  # Reduced from 0.1
+        # Calculate dollar amount with maximum position cap - significantly reduced cap
+        position_value = min(base_size * delta_factor, account_value * 0.05)  # Reduced from 0.07
         
         # Options have multiplier (usually 100)
         contract_value = option_price * 100
@@ -192,7 +191,7 @@ class RiskManager:
         # Calculate number of contracts with better risk control
         if contract_value > 0:
             # Limit the number of contracts based on absolute risk - more conservative
-            max_contracts_by_risk = int((account_value * (self.risk_params.max_daily_risk_pct / 100 * 0.8)) / contract_value)  # Added 0.8 factor
+            max_contracts_by_risk = int((account_value * (self.risk_params.max_daily_risk_pct / 100 * 0.7)) / contract_value)  # Reduced factor from 0.8
             quantity = min(int(position_value / contract_value), max_contracts_by_risk)
         else:
             quantity = 0
@@ -203,11 +202,11 @@ class RiskManager:
         
         # For very expensive options, ensure we take at least one contract if we can afford it
         # but only if it doesn't exceed a reasonable percentage of account
-        if quantity == 0 and contract_value <= account_value * 0.03:  # Reduced from 0.05
+        if quantity == 0 and contract_value <= account_value * 0.02:  # Reduced from 0.03
             quantity = 1
             self.logger.info(f"Adjusted to minimum 1 contract due to affordability check")
                        
-        return max(1, quantity)  # Ensure at least 1 contract
+        return quantity  # No longer enforcing minimum 1 contract
     
     def update_daily_pnl(self, trade_pnl: float) -> bool:
         """
