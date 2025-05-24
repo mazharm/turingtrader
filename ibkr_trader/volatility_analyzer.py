@@ -305,7 +305,8 @@ class VolatilityAnalyzer:
                 'error': str(e)
             }
     
-    def _calculate_opportunity_score(self, iv: float, days_to_expiry: int, volume: int, bid: float) -> float:
+    def _calculate_opportunity_score(self, iv: float, days_to_expiry: int, volume: int, bid: float, 
+                                 ask: float = None, open_interest: int = None, spread_pct: float = None) -> float:
         """
         Calculate a quality score for an option opportunity.
         Higher score means better opportunity.
@@ -315,31 +316,53 @@ class VolatilityAnalyzer:
             days_to_expiry: Days to expiration
             volume: Trading volume
             bid: Bid price
+            ask: Ask price (optional)
+            open_interest: Open interest (optional)
+            spread_pct: Bid-ask spread percentage (optional)
             
         Returns:
             Quality score (0-100)
         """
         # IV score (higher IV is better, but with diminishing returns)
         iv_pct = iv * 100  # Convert to percentage
-        iv_score = min(50, iv_pct * 1.5)  # Cap at 50
+        iv_score = min(45, iv_pct * 1.2)  # Cap at 45, reduced weighting to emphasize other factors
         
-        # Days to expiry score (30-45 days is optimal for theta decay)
+        # Days to expiry score (20-40 days is optimal for iron condors)
         dte_score = 0
-        if 25 <= days_to_expiry <= 50:
-            dte_score = 30  # Optimal range
-        elif 15 <= days_to_expiry < 25 or 50 < days_to_expiry <= 60:
-            dte_score = 20  # Good range
+        if 20 <= days_to_expiry <= 40:
+            dte_score = 25  # Optimal range - reduced from 30
+        elif 15 <= days_to_expiry < 20 or 40 < days_to_expiry <= 50:
+            dte_score = 15  # Good range - reduced from 20
         else:
-            dte_score = 10  # Acceptable range
+            dte_score = 5   # Acceptable range - reduced from 10
             
         # Volume score (higher volume means better liquidity)
-        volume_score = min(10, volume / 100)
+        volume_score = min(15, volume / 80)  # Increased weight from 10 to 15
         
         # Bid price score (higher premium is better)
-        bid_score = min(10, bid * 5)
+        bid_score = min(15, bid * 4)  # Increased weight from 10 to 15
+        
+        # Add open interest score if available
+        oi_score = 0
+        if open_interest is not None:
+            oi_score = min(10, open_interest / 100)  # New factor
+        
+        # Add spread quality score if available
+        spread_score = 0
+        if spread_pct is not None and spread_pct > 0:
+            # Lower spread_pct is better (tighter spread)
+            if spread_pct < 0.05:
+                spread_score = 15  # Excellent spread
+            elif spread_pct < 0.10:
+                spread_score = 10  # Good spread
+            elif spread_pct < 0.15:
+                spread_score = 5   # Acceptable spread
         
         # Total score
-        return iv_score + dte_score + volume_score + bid_score
+        total_score = iv_score + dte_score + volume_score + bid_score + oi_score + spread_score
+        
+        # Return normalized score (0-100)
+        return min(100, total_score)
         
     def analyze_option_chain(self, chain_data: Dict) -> Dict:
         """
@@ -390,44 +413,71 @@ class VolatilityAnalyzer:
                     # Adjust the min_volatility_threshold to ensure we're targeting higher IV options
                     min_iv_threshold = self.min_volatility_threshold / 100
                     
-                    # For calls: Only consider those with enough premium and volume
+                    # For calls: Only consider those with enough premium, volume, and better spreads
                     for strike, option in calls.items():
                         iv = option.get('iv', 0)
                         bid = option.get('bid', 0)
+                        ask = option.get('ask', 0)
                         volume = option.get('volume', 0) if option.get('volume') is not None else 0
+                        open_interest = option.get('open_interest', 0) if option.get('open_interest') is not None else 0
                         
                         # Higher threshold for IV to ensure we're capturing true high-volatility opportunities
-                        # Also check if there's reasonable bid price and volume
-                        if iv > min_iv_threshold and bid >= 0.1 and volume >= 10:
+                        # Also check for reasonable bid price, volume, and bid-ask spread
+                        spread_pct = (ask - bid) / bid if bid > 0 else float('inf')
+                        
+                        if (iv > min_iv_threshold * 1.1 and  # Increased minimum IV by 10%
+                            bid >= 0.15 and                   # Increased minimum bid
+                            volume >= 15 and                  # Increased minimum volume
+                            open_interest >= 50 and           # Added minimum open interest
+                            spread_pct < 0.15):               # Added maximum bid-ask spread percentage
+                            
                             result['opportunities'].append({
                                 'type': 'call',
                                 'expiry': expiry,
                                 'strike': strike,
                                 'iv': iv,
                                 'days_to_expiry': days_to_expiry,
-                                'bid': option.get('bid', 0),
-                                'ask': option.get('ask', 0),
+                                'bid': bid,
+                                'ask': ask,
                                 'volume': volume,
-                                'quality_score': self._calculate_opportunity_score(iv, days_to_expiry, volume, bid)
+                                'open_interest': open_interest,
+                                'spread_pct': spread_pct,
+                                'quality_score': self._calculate_opportunity_score(
+                                    iv, days_to_expiry, volume, bid, 
+                                    ask=ask, open_interest=open_interest, spread_pct=spread_pct
+                                )
                             })
                     
-                    # For puts: Similar criteria as calls
+                    # For puts: Similar but more stringent criteria as calls
                     for strike, option in puts.items():
                         iv = option.get('iv', 0)
                         bid = option.get('bid', 0)
+                        ask = option.get('ask', 0)
                         volume = option.get('volume', 0) if option.get('volume') is not None else 0
+                        open_interest = option.get('open_interest', 0) if option.get('open_interest') is not None else 0
                         
-                        if iv > min_iv_threshold and bid >= 0.1 and volume >= 10:
+                        spread_pct = (ask - bid) / bid if bid > 0 else float('inf')
+                        
+                        if (iv > min_iv_threshold * 1.1 and  # Increased minimum IV by 10%
+                            bid >= 0.15 and                   # Increased minimum bid
+                            volume >= 15 and                  # Increased minimum volume
+                            open_interest >= 50 and           # Added minimum open interest
+                            spread_pct < 0.15):               # Added maximum bid-ask spread percentage
                             result['opportunities'].append({
                                 'type': 'put',
                                 'expiry': expiry,
                                 'strike': strike,
                                 'iv': iv,
                                 'days_to_expiry': days_to_expiry,
-                                'bid': option.get('bid', 0),
-                                'ask': option.get('ask', 0),
+                                'bid': bid,
+                                'ask': ask,
                                 'volume': volume,
-                                'quality_score': self._calculate_opportunity_score(iv, days_to_expiry, volume, bid)
+                                'open_interest': open_interest,
+                                'spread_pct': spread_pct,
+                                'quality_score': self._calculate_opportunity_score(
+                                    iv, days_to_expiry, volume, bid, 
+                                    ask=ask, open_interest=open_interest, spread_pct=spread_pct
+                                )
                             })
             
             # Calculate overall average IVs
@@ -512,24 +562,29 @@ class VolatilityAnalyzer:
         if not self.use_adaptive_thresholds:
             return
             
+        # Add to history for tracking VIX changes
+        self.vix_history.append(current_vix)
+        if len(self.vix_history) > 30:  # Keep last 30 days
+            self.vix_history.pop(0)
+            
         # Update IV threshold based on VIX
         # In higher volatility environments, we need higher IV for signals
         # Made more conservative in high volatility environments
         if current_vix > 35:
             # Extreme volatility - significantly increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.5
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.7  # Increased from 1.5
         elif current_vix > 30:
             # Very high volatility - substantially increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.4
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.5  # Increased from 1.4
         elif current_vix > 25:
             # High volatility - moderately increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.25
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.3  # Increased from 1.25
         elif current_vix > 20:
             # Above average volatility - slightly increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.1
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.15  # Increased from 1.1
         elif current_vix < 15:
-            # Low volatility - slightly decrease threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 0.9
+            # Low volatility - slightly decrease threshold but maintain selectivity
+            self.adaptive_iv_threshold = self.min_iv_threshold * 0.95  # Increased from 0.9
         else:
             # Normal volatility - use standard threshold
             self.adaptive_iv_threshold = self.min_iv_threshold
@@ -539,17 +594,17 @@ class VolatilityAnalyzer:
         if len(self.vix_history) >= 5:
             vix_std = np.std(self.vix_history[-5:])
             if vix_std > 3.0:  # Extremely volatile VIX
-                # Be more selective in extreme volatility
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.2
+                # Be much more selective in extreme volatility
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.4  # Increased from 1.2
             elif vix_std > 2.0:  # Very volatile VIX
                 # Be more selective in high volatility
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.1
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.25  # Increased from 1.1
             elif vix_std > 1.0:  # Moderately volatile VIX
-                # Maintain normal selectivity
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
+                # Be somewhat more selective even in moderate volatility
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.1  # New level instead of 1.0
             elif vix_std < 0.5:  # Very stable VIX
-                # Be slightly less selective in stable markets
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.95
+                # Be only slightly less selective in stable markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.97  # Less reduction (from 0.95)
             else:
                 self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
     
