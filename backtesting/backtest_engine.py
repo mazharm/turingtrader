@@ -80,7 +80,7 @@ class BacktestEngine:
         self.risk_manager.update_account_value(self.initial_balance)
         self.options_strategy.reset_daily_state()
     
-    def run_backtest(self, start_date: str, end_date: str, risk_level: int = 5) -> Dict:
+    def run_backtest(self, start_date: str, end_date: str, risk_level: int = 5, use_cache: bool = True) -> Dict:
         """
         Run a backtest over a specified date range.
         
@@ -88,6 +88,7 @@ class BacktestEngine:
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
             risk_level: Risk level (1-10)
+            use_cache: Whether to use cached data if available
             
         Returns:
             Dict with backtest results
@@ -112,14 +113,16 @@ class BacktestEngine:
             underlying_data = self.data_fetcher.fetch_data(
                 self.config.trading.index_symbol,
                 start_date,
-                end_date
+                end_date,
+                use_cache=use_cache
             )
             
             # Fetch VIX data
             vix_data = self.data_fetcher.fetch_data(
                 'VIX',
                 start_date,
-                end_date
+                end_date,
+                use_cache=use_cache
             )
             
             # Align dates between VIX and underlying

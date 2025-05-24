@@ -68,6 +68,13 @@ def parse_arguments():
         help='Run with mock data for testing purposes'
     )
     
+    # Force refreshing data
+    parser.add_argument(
+        '--refresh-data',
+        action='store_true',
+        help='Force refresh of historical data (ignore cache)'
+    )
+    
     # Logging
     parser.add_argument(
         '--log-level',
@@ -168,11 +175,28 @@ def evaluate_algorithm(args):
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Create data fetcher - use MockDataFetcher in test mode, or HistoricalDataFetcher otherwise
+    if args.test_mode:
+        data_fetcher = MockDataFetcher()
+        logging.warning("Using MOCK data for backtesting. Results will NOT reflect real market performance.")
+    else:
+        data_dir = os.path.join(os.getcwd(), 'data')
+        logging.info(f"Using REAL historical data from Yahoo Finance. Data will be cached in {data_dir}")
+        # Clear cache if refresh data is requested
+        if args.refresh_data:
+            logging.info("Refreshing historical data - ignoring cache")
+            # Create a data fetcher and clear its cache
+            temp_fetcher = HistoricalDataFetcher(data_dir=data_dir)
+            temp_fetcher.clear_cache()
+        
+        # Create the data fetcher with the appropriate cache setting
+        data_fetcher = HistoricalDataFetcher(data_dir=data_dir)
+    
     # Create backtest engine
     engine = BacktestEngine(
         config=config,
         initial_balance=args.initial_investment,
-        data_fetcher=MockDataFetcher() if args.test_mode else None
+        data_fetcher=data_fetcher
     )
     
     # Define risk levels (1-10)
@@ -186,7 +210,8 @@ def evaluate_algorithm(args):
         results = engine.run_backtest(
             start_date=start_date,
             end_date=end_date,
-            risk_level=risk_level
+            risk_level=risk_level,
+            use_cache=not args.refresh_data
         )
         
         # Store results
