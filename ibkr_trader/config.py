@@ -158,12 +158,27 @@ class VolatilityHarvestingConfig:
 class AppConfig:
     """Main application configuration, aggregating all specific configurations."""
     
-    ibkr: IBKRConfig = IBKRConfig()
-    risk: RiskParameters = RiskParameters()
-    trading: TradingConfig = TradingConfig()
-    postgres: PostgresConfig = PostgresConfig()
-    redis: RedisConfig = RedisConfig()
-    vol_harvesting: VolatilityHarvestingConfig = VolatilityHarvestingConfig()
+    ibkr: IBKRConfig = None
+    risk: RiskParameters = None
+    trading: TradingConfig = None
+    postgres: PostgresConfig = None
+    redis: RedisConfig = None
+    vol_harvesting: VolatilityHarvestingConfig = None
+    
+    def __post_init__(self):
+        """Initialize default values for mutable fields."""
+        if self.ibkr is None:
+            self.ibkr = IBKRConfig()
+        if self.risk is None:
+            self.risk = RiskParameters()
+        if self.trading is None:
+            self.trading = TradingConfig()
+        if self.postgres is None:
+            self.postgres = PostgresConfig()
+        if self.redis is None:
+            self.redis = RedisConfig()
+        if self.vol_harvesting is None:
+            self.vol_harvesting = VolatilityHarvestingConfig()
         
     def _get_config_value(self, parser: configparser.ConfigParser, section: str, key: str, type_converter, default: Any = None) -> Any:
         """Helper to safely get and convert config values."""
@@ -260,9 +275,9 @@ class AppConfig:
 
         # Load VolatilityHarvesting settings
         if parser.has_section("VolatilityHarvesting"):
-            self.volatility_harvesting.iv_hv_ratio_threshold = self._get_config_value(parser, "VolatilityHarvesting", "iv_hv_ratio_threshold", float, self.volatility_harvesting.iv_hv_ratio_threshold)
-            self.volatility_harvesting.min_iv_threshold = self._get_config_value(parser, "VolatilityHarvesting", "min_iv_threshold", float, self.volatility_harvesting.min_iv_threshold)
-            self.volatility_harvesting.use_adaptive_thresholds = self._get_config_value(parser, "VolatilityHarvesting", "use_adaptive_thresholds", parser.getboolean, self.volatility_harvesting.use_adaptive_thresholds)
+            self.vol_harvesting.iv_hv_ratio_threshold = self._get_config_value(parser, "VolatilityHarvesting", "iv_hv_ratio_threshold", float, self.vol_harvesting.iv_hv_ratio_threshold)
+            self.vol_harvesting.min_iv_threshold = self._get_config_value(parser, "VolatilityHarvesting", "min_iv_threshold", float, self.vol_harvesting.min_iv_threshold)
+            self.vol_harvesting.use_adaptive_thresholds = self._get_config_value(parser, "VolatilityHarvesting", "use_adaptive_thresholds", parser.getboolean, self.vol_harvesting.use_adaptive_thresholds)
             # Add other VolatilityHarvesting parameters as needed
 
         logger.info("Configuration loaded successfully.")
@@ -333,3 +348,6 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
 if __name__ == "__main__":
     # If run directly, create a default config file
     create_default_config_file()
+
+# For backward compatibility
+Config = AppConfig

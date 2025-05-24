@@ -13,6 +13,7 @@ from ibkr_trader.config import Config
 from ibkr_trader.volatility_analyzer import VolatilityAnalyzer
 from ibkr_trader.risk_manager import RiskManager
 from ibkr_trader.options_strategy import OptionsStrategy
+from historical_data.data_fetcher import HistoricalDataFetcher
 
 
 class BacktestEngine:
