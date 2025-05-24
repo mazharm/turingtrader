@@ -7,10 +7,13 @@ different parameters and shows how to access and utilize the results.
 """
 
 import os
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
+# Add parent directory to path to import evaluate_algorithm
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evaluate_algorithm import evaluate_algorithm, generate_investment_growth_chart
 from utils.logging_util import setup_logging
 
