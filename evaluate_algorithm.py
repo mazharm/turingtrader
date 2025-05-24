@@ -194,18 +194,38 @@ def evaluate_algorithm(args):
         # Create the data fetcher with the appropriate cache setting
         data_fetcher = HistoricalDataFetcher(data_dir=data_dir)
         
-        # Test if we can fetch data from Yahoo Finance
-        try:
-            spy_test = data_fetcher.fetch_data('SPY', 
-                                             (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
-                                             datetime.now().strftime('%Y-%m-%d'),
-                                             use_cache=False)
-            if spy_test.empty:
-                raise Exception("No data returned from Yahoo Finance")
+        # Test if we can fetch data from Yahoo Finance with multiple symbols
+        # Try to fetch SPY and VIX data as both are needed for the algorithm
+        success = True
+        test_symbols = ['SPY', 'VIX']
+        test_start = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        test_end = datetime.now().strftime('%Y-%m-%d')
+        
+        for symbol in test_symbols:
+            try:
+                test_data = data_fetcher.fetch_data(
+                    symbol, 
+                    test_start,
+                    test_end,
+                    use_cache=False,
+                    max_retries=3
+                )
                 
-        except Exception as e:
-            logging.warning(f"Failed to connect to Yahoo Finance: {e}")
+                if test_data.empty:
+                    logging.warning(f"No data returned from Yahoo Finance for {symbol}")
+                    success = False
+                    break
+                else:
+                    logging.info(f"Successfully fetched test data for {symbol}: {len(test_data)} rows")
+                    
+            except Exception as e:
+                logging.warning(f"Failed to connect to Yahoo Finance for {symbol}: {e}")
+                success = False
+                break
+        
+        if not success:
             logging.warning("Falling back to REALISTIC MOCK data. This data simulates real market behavior but is not actual historical data.")
+            logging.warning("For accurate backtesting, please ensure that your internet connection is working and Yahoo Finance API is accessible.")
             data_fetcher = RealisticMockDataFetcher(data_dir=data_dir)
             # Clear mock cache if refresh data is requested
             if args.refresh_data:
