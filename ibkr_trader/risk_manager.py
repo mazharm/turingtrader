@@ -114,18 +114,20 @@ class RiskManager:
         # Base position size as percentage of max position size
         base_size = self.max_position_size * vol_multiplier
         
-        # Adjust for volatility - reduce position size in extreme volatility
+        # Adjust for volatility - use a more nuanced approach for volatility scaling
         if volatility > 40:
-            vol_factor = 0.6
+            vol_factor = 0.5  # High volatility - reduce position size significantly
         elif volatility > 30:
-            vol_factor = 0.8
+            vol_factor = 0.7  # Above average volatility - reduce position size moderately
         elif volatility > 20:
-            vol_factor = 1.0
+            vol_factor = 0.9  # Normal volatility - slight reduction
+        elif volatility > 15:
+            vol_factor = 1.0  # Optimal volatility range - full position size
         else:
-            vol_factor = 0.7  # Lower position size in low volatility
+            vol_factor = 0.8  # Low volatility - reduce position size as premiums are likely too small
             
-        # Calculate dollar amount
-        position_value = base_size * vol_factor
+        # Calculate dollar amount - add a cap to prevent excessively large positions
+        position_value = min(base_size * vol_factor, account_value * 0.15)
         
         # Convert to quantity
         quantity = int(position_value / price)
@@ -166,28 +168,41 @@ class RiskManager:
         # Base position value as percentage of max position size
         base_size = self.max_position_size * vol_multiplier
         
-        # Adjust for delta exposure
-        # Higher delta = fewer contracts to stay within delta exposure limits
-        if abs_delta > 0.01:  # Avoid division by very small deltas
+        # Improved delta-based adjustment
+        # Scale based on option delta to manage risk more effectively
+        if abs_delta > 0.7:  # Deep ITM options
+            delta_factor = min(0.5, self.max_delta_exposure / (100 * abs_delta))
+        elif abs_delta > 0.4:  # Moderate delta
+            delta_factor = min(0.7, self.max_delta_exposure / (100 * abs_delta))
+        elif abs_delta > 0.2:  # Standard delta range for many strategies
             delta_factor = min(1.0, self.max_delta_exposure / (100 * abs_delta))
-        else:
-            delta_factor = 0.5  # Default for very low delta
+        elif abs_delta > 0.05:  # Lower delta (OTM options)
+            delta_factor = min(0.8, self.max_delta_exposure / (100 * abs_delta))
+        else:  # Very low delta (far OTM options)
+            delta_factor = 0.4  # Reduce size for very low delta options
             
-        # Calculate dollar amount
-        position_value = base_size * delta_factor
+        # Calculate dollar amount with maximum position cap
+        position_value = min(base_size * delta_factor, account_value * 0.1)
         
         # Options have multiplier (usually 100)
         contract_value = option_price * 100
         
-        # Calculate number of contracts
+        # Calculate number of contracts with better risk control
         if contract_value > 0:
-            quantity = int(position_value / contract_value)
+            # Limit the number of contracts based on absolute risk
+            max_contracts_by_risk = int((account_value * (self.risk_params.max_daily_risk_pct / 100)) / contract_value)
+            quantity = min(int(position_value / contract_value), max_contracts_by_risk)
         else:
             quantity = 0
             
         self.logger.info(f"Calculated option quantity: {quantity} contracts "
                        f"(${position_value:.2f}, delta: {abs_delta:.2f}, "
                        f"contract value: ${contract_value:.2f})")
+        
+        # For very expensive options, ensure we take at least one contract if we can afford it
+        if quantity == 0 and contract_value <= account_value * 0.05:
+            quantity = 1
+            self.logger.info(f"Adjusted to minimum 1 contract due to affordability check")
                        
         return max(1, quantity)  # Ensure at least 1 contract
     
