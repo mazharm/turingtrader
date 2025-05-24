@@ -273,6 +273,18 @@ def evaluate_algorithm(args):
     print("\n=== ALGORITHM EVALUATION SUMMARY ===")
     print(f"Evaluation Period: {start_date} to {end_date}")
     print(f"Initial Investment: ${args.initial_investment:,.2f}")
+    
+    # Print information about data source
+    if isinstance(data_fetcher, RealisticMockDataFetcher):
+        print("\nNOTE: Using REALISTIC MOCK data for backtesting.")
+        print("This data simulates real market behavior but is not actual historical data.")
+        print("For accurate production results, ensure that Yahoo Finance data is accessible.")
+    elif isinstance(data_fetcher, MockDataFetcher):
+        print("\nWARNING: Using SIMPLIFIED MOCK data for testing purposes only.")
+        print("Results do NOT represent real market performance.")
+    else:
+        print("\nUsing REAL historical market data from Yahoo Finance.")
+    
     print("\nBest Performance by Risk Level:")
     
     if 'optimal_risk_level' in comparison:
@@ -284,6 +296,27 @@ def evaluate_algorithm(args):
               f"(Return: {comparison['total_returns'][comparison['risk_levels'].index(comparison['best_return_risk_level'])]:,.2f}%)")
     
     print(f"\nResults saved to: {args.output_dir}")
+    
+    # Print summary performance table
+    print("\nPerformance Summary Across Risk Levels:")
+    print("------------------------------------------------------")
+    print("Risk | Return (%) | Max DD (%) | Sharpe | Trades | Win %")
+    print("------------------------------------------------------")
+    
+    for risk_level in range(1, 11):
+        if risk_level in results_by_risk:
+            result = results_by_risk[risk_level]
+            total_return = result.get('total_return_pct', 0)
+            max_drawdown = result.get('max_drawdown_pct', 0)
+            sharpe = result.get('sharpe_ratio', 0)
+            trades = result.get('total_trades', 0)
+            win_rate = result.get('win_rate', 0) * 100
+            
+            print(f"{risk_level:4d} | {total_return:10.2f} | {max_drawdown:10.2f} | {sharpe:6.2f} | {trades:6d} | {win_rate:5.1f}")
+    
+    print("------------------------------------------------------")
+    print("NOTE: Negative values for Max DD represent drawdowns (losses).")
+    print("      Higher Sharpe ratios indicate better risk-adjusted returns.")
     
     return 0
 
