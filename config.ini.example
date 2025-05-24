@@ -46,11 +46,11 @@ default_expiry = 3600
 
 [VolatilityHarvesting]
 # Enhanced Adaptive Volatility-Harvesting System settings
-iv_hv_ratio_threshold = 1.2
+iv_hv_ratio_threshold = 1.3
 min_iv_threshold = 25.0
 use_adaptive_thresholds = True
-strike_width_pct = 1.0
+strike_width_pct = 5.0
 target_short_delta = 0.3
-target_long_delta = 0.1
+target_long_delta = 0.15
 min_dte = 14
 max_dte = 45
