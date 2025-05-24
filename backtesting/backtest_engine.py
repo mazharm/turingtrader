@@ -5,6 +5,7 @@ Backtesting engine for the TuringTrader algorithm.
 import logging
 import pandas as pd
 import numpy as np
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union, Any
 
