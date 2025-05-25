@@ -57,31 +57,33 @@ class RiskParameters:
     # Risk level (1-10, where 10 is highest risk)
     risk_level: int = 5
     
-    # Maximum percentage of account to risk per day
-    max_daily_risk_pct: float = 2.0
+    # Maximum percentage of account to risk per day (reduced for capital preservation)
+    max_daily_risk_pct: float = 1.5
     
-    # Minimum volatility threshold to enter positions (annualized %)
-    min_volatility_threshold: float = 15.0
+    # Minimum volatility threshold to enter positions (annualized %, increased for more selective entry)
+    min_volatility_threshold: float = 18.0
     
-    # Maximum position size as percentage of account
-    max_position_size_pct: float = 20.0
+    # Maximum position size as percentage of account (reduced for better capital management)
+    max_position_size_pct: float = 15.0
     
-    # Maximum options delta exposure
-    max_delta_exposure: float = 50.0
+    # Maximum options delta exposure (reduced to limit risk)
+    max_delta_exposure: float = 40.0
     
-    # Stop loss percentage per position
-    stop_loss_pct: float = 20.0
+    # Stop loss percentage per position (tightened to minimize drawdowns)
+    stop_loss_pct: float = 15.0
     
-    # Target profit percentage per position
-    target_profit_pct: float = 30.0
+    # Target profit percentage per position (reduced for more achievable targets)
+    target_profit_pct: float = 22.0
     
-    # Minimum volatility change to trigger trading (percentage points)
-    min_volatility_change: float = 2.0
+    # Minimum volatility change to trigger trading (increased for more selective entry)
+    min_volatility_change: float = 2.5
 
-    # For Iron Condors: factor of max risk for stop loss (e.g., 50 means SL if loss = 50% of max risk)
-    condor_stop_loss_factor_of_max_risk: float = 50.0 
-    # For Iron Condors: factor of credit for profit target (e.g., 80 means TP if 80% of credit is retained)
-    condor_profit_target_factor_of_credit: float = 80.0
+    # For Iron Condors: factor of max risk for stop loss (reduced for tighter stop losses)
+    # e.g., 40 means stop loss if loss = 40% of max risk
+    condor_stop_loss_factor_of_max_risk: float = 40.0 
+    # For Iron Condors: factor of credit for profit target (increased to take profits earlier)
+    # e.g., 85 means take profit when 85% of credit can be retained (buy back at 15% of credit)
+    condor_profit_target_factor_of_credit: float = 85.0
     
     def adjust_for_risk_level(self, level: int) -> None:
         """Adjust risk parameters based on risk level (1-10)."""
@@ -91,33 +93,33 @@ class RiskParameters:
         # Scale parameters according to risk level
         self.risk_level = level
         
-        # Lower risk means higher volatility threshold for entry - increased to be more selective
-        self.min_volatility_threshold = 20 + (10 - level) * 1.8
+        # Lower risk means higher volatility threshold for entry - made more selective across all levels
+        self.min_volatility_threshold = 22 + (10 - level) * 2.0  # Increased from 20 + (10 - level) * 1.8
         
-        # Lower risk means lower daily risk - made more conservative across all levels
-        self.max_daily_risk_pct = 0.4 + level * 0.25  # Reduced from 0.5 + level * 0.3
+        # Lower risk means lower daily risk - more conservative across all levels
+        self.max_daily_risk_pct = 0.3 + level * 0.2  # Reduced from 0.4 + level * 0.25
         
-        # Lower risk means smaller position size - reduced for more appropriate sizing
-        self.max_position_size_pct = 2 + level * 1.5   # Reduced from 3 + level * 2
+        # Lower risk means smaller position size - reduced for better risk management
+        self.max_position_size_pct = 1.5 + level * 1.2   # Reduced from 2 + level * 1.5
         
-        # Lower risk means lower delta exposure - adjusted for better delta risk control
-        self.max_delta_exposure = 5 + level * 4  # Reduced from 5 + level * 5
+        # Lower risk means lower delta exposure - significantly reduced exposure
+        self.max_delta_exposure = 4 + level * 3  # Reduced from 5 + level * 4
         
         # Lower risk means tighter stop loss - improved to prevent larger drawdowns
-        self.stop_loss_pct = 8 + level * 1.2  # Reduced from 10 + level * 1.5
+        self.stop_loss_pct = 6 + level * 1.0  # Reduced from 8 + level * 1.2
         
         # Lower risk means lower but more achievable target profit - more realistic targets
-        self.target_profit_pct = 12 + level * 1.5  # Reduced from 15 + level * 2
+        self.target_profit_pct = 10 + level * 1.2  # Reduced from 12 + level * 1.5
         
         # Lower risk means requiring larger volatility changes to trade - more selective entry
-        self.min_volatility_change = 3.5 - (level * 0.2)  # Increased from 3 - (level * 0.2)
+        self.min_volatility_change = 4.0 - (level * 0.15)  # Increased from 3.5 - (level * 0.2)
         
         # Iron Condor specific adjustments
-        # More conservative stop loss for lower risk levels
-        self.condor_stop_loss_factor_of_max_risk = 25 + (level * 2.5)  # Reduced from 30 + (level * 3)
+        # More conservative stop loss for all risk levels
+        self.condor_stop_loss_factor_of_max_risk = 20 + (level * 2.0)  # Reduced from 25 + (level * 2.5)
         
-        # More achievable profit targets for lower risk levels - take profits earlier
-        self.condor_profit_target_factor_of_credit = 65 + (10 - level) * 3  # Increased from 60 + (10 - level) * 3
+        # More achievable profit targets - take profits earlier
+        self.condor_profit_target_factor_of_credit = 70 + (10 - level) * 3.5  # Increased from 65 + (10 - level) * 3
 
 
 @dataclass
@@ -145,32 +147,28 @@ class TradingConfig:
 @dataclass
 class VolatilityHarvestingConfig:
     """Configuration for the Adaptive Volatility-Harvesting System."""
-    # IV/HV ratio threshold for signal generation
-    # Increased to 1.3 for more selective entry points (balanced approach from volatility report)
-    iv_hv_ratio_threshold: float = 1.3
+    # IV/HV ratio threshold for signal generation - increased for more selective entry
+    iv_hv_ratio_threshold: float = 1.5
     
-    # Minimum IV required for trade entry
-    # Maintained at 25.0 for more conservative approach
-    min_iv_threshold: float = 25.0
+    # Minimum IV required for trade entry - increased to avoid low volatility periods
+    min_iv_threshold: float = 30.0
     
     # Use adaptive thresholds based on market conditions
     use_adaptive_thresholds: bool = True
     
     # Range around calculated strikes for iron condor legs (percentage)
-    # Increased from 1.0 to 5.0 for better protection (balanced approach from volatility report)
-    strike_width_pct: float = 5.0
+    # Increased for better protection
+    strike_width_pct: float = 7.5
     
-    # Target delta for short options legs
-    # Maintained at 0.3 (balanced approach from volatility report)
-    target_short_delta: float = 0.3
+    # Target delta for short options legs - reduced for less directional exposure
+    target_short_delta: float = 0.25
     
-    # Target delta for long options legs
-    # Adjusted to be more conservative with wider protection
-    target_long_delta: float = 0.15
+    # Target delta for long options legs - adjusted for better protection
+    target_long_delta: float = 0.10
     
-    # Default days to expiration range
-    min_dte: int = 14
-    max_dte: int = 45
+    # Default days to expiration range - adjusted for better time decay management
+    min_dte: int = 18
+    max_dte: int = 35
 
 
 @dataclass
@@ -317,8 +315,8 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
     config['Risk'] = {
         'risk_level': '5',
         'comment': 'Risk level range: 1 (lowest) to 10 (highest)',
-        'condor_stop_loss_factor_of_max_risk': '50.0', # Example: SL if 50% of max risk is lost
-        'condor_profit_target_factor_of_credit': '80.0' # Example: TP if 80% of credit can be kept (i.e. buy back for 20% of credit)
+        'condor_stop_loss_factor_of_max_risk': '40.0', # Example: SL if 40% of max risk is lost
+        'condor_profit_target_factor_of_credit': '85.0' # Example: TP if 85% of credit can be kept (i.e. buy back for 15% of credit)
     }
     
     config['Trading'] = {
@@ -348,14 +346,14 @@ def create_default_config_file(filename: str = 'config.ini') -> None:
     }
     
     config['VolatilityHarvesting'] = {
-        'iv_hv_ratio_threshold': '1.3',
-        'min_iv_threshold': '25.0',
+        'iv_hv_ratio_threshold': '1.5',
+        'min_iv_threshold': '30.0',
         'use_adaptive_thresholds': 'True',
-        'strike_width_pct': '5.0',
-        'target_short_delta': '0.3',
-        'target_long_delta': '0.15',
-        'min_dte': '14',
-        'max_dte': '45'
+        'strike_width_pct': '7.5',
+        'target_short_delta': '0.25',
+        'target_long_delta': '0.10',
+        'min_dte': '18',
+        'max_dte': '35'
     }
     
     with open(filename, 'w') as f:
