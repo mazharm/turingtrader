@@ -449,85 +449,191 @@ class OptionsStrategy:
         current_vix = vix_analysis.get('current_vix', 0)
         vix_change_1d = vix_analysis.get('vix_change_1d', 0)
         vix_change_5d = vix_analysis.get('vix_change_5d', 0)
+        vix_trend = vix_analysis.get('vix_trend', 'flat')
+        vix_regime = vix_analysis.get('vix_regime', 'normal')
         iv_hv_ratio = vol_harvest_analysis.get('iv_hv_ratio', 0)
         volatility_state = vix_analysis.get('volatility_state', 'normal')
         
-        # Decision metrics for strategy selection
+        # Enhanced decision metrics for strategy selection
         # ------------------------------------------------
-        # 1. Extremely high volatility environment: Use bull put spreads
-        # 2. Moderately high volatility + rising: Use bear call spreads
-        # 3. Balanced volatility environment: Use iron condors
-        # 4. Default to iron condors as the base strategy
+        # 1. Extremely high volatility environment with decreasing VIX: Bull Put Spreads
+        # 2. High volatility environment with rising VIX: Bear Call Spreads
+        # 3. Normal volatility with high IV/HV ratio: Iron Condors
+        # 4. Stable, low volatility environments: Iron Condors with narrower width
+        # 5. Default: No trade if conditions aren't favorable
         
-        self.logger.info(f"Market conditions - VIX: {current_vix:.1f}, VIX 1d change: {vix_change_1d:.1f}, "
-                       f"VIX 5d change: {vix_change_5d:.1f}, IV/HV ratio: {iv_hv_ratio:.2f}, "
-                       f"State: {volatility_state}")
+        self.logger.info(f"Market conditions - VIX: {current_vix:.1f}, Change 1d: {vix_change_1d:.1f}, "
+                       f"Change 5d: {vix_change_5d:.1f}, IV/HV ratio: {iv_hv_ratio:.2f}, "
+                       f"State: {volatility_state}, Trend: {vix_trend}, Regime: {vix_regime}")
         
         # Strategy selection based on volatility environment
-        strategy = "iron_condor"  # Default strategy
+        strategy = None  # Start with no strategy - must meet criteria to trade
         spread_type = None
+        min_credit_threshold = 0.0  # Base minimum credit
+        min_return_on_risk = 0.0    # Base minimum return on risk
         
-        # High volatility environments - consider vertical spreads instead of iron condors
-        if current_vix > 30:
-            # In very high volatility, look for bull put spreads (bet on support levels)
-            if vix_change_1d < -0.5:  # VIX is starting to decline
+        # Set minimum requirements based on volatility regime
+        if vix_regime == 'crisis':
+            # In crisis regime, require substantial premium
+            min_credit_threshold = 0.50  # Minimum $0.50 per spread
+            min_return_on_risk = 20.0    # Minimum 20% return on risk
+        elif vix_regime == 'high_volatility':
+            min_credit_threshold = 0.35  # Minimum $0.35 per spread
+            min_return_on_risk = 15.0    # Minimum 15% return on risk
+        elif vix_regime == 'normal':
+            min_credit_threshold = 0.25  # Minimum $0.25 per spread
+            min_return_on_risk = 12.0    # Minimum 12% return on risk
+        else:  # low_volatility
+            min_credit_threshold = 0.20  # Minimum $0.20 per spread
+            min_return_on_risk = 10.0    # Minimum 10% return on risk
+        
+        # Strategy decision tree with enhanced selectivity
+        if volatility_state in ('extreme', 'high'):
+            # Extreme volatility (VIX > 25)
+            if vix_trend in ('down', 'strong_down'):
+                # VIX declining - bullish bias
                 strategy = "vertical_spread"
                 spread_type = "bull_put"
-                self.logger.info("High volatility with VIX starting to decline - selecting bull put spreads")
-            elif vix_change_1d > 1.0:  # VIX still rising strongly
+                min_credit_threshold *= 1.2  # Higher minimum for extreme vol
+                self.logger.info(f"High volatility with {vix_trend} VIX trend - selecting bull put spreads")
+            elif vix_trend in ('up', 'strong_up'):
+                # VIX rising - bearish bias
                 strategy = "vertical_spread"
                 spread_type = "bear_call"
-                self.logger.info("High volatility with VIX still rising - selecting bear call spreads")
-        elif current_vix > 25:
-            # In moderately high volatility
-            if vix_change_5d > 3.0:  # Strong volatility expansion over past week
-                # More conservative to use vertical spreads in expanding volatility
+                min_credit_threshold *= 1.2  # Higher minimum for extreme vol
+                self.logger.info(f"High volatility with {vix_trend} VIX trend - selecting bear call spreads")
+            elif iv_hv_ratio > 1.4:
+                # Very high IV/HV ratio - premium selling opportunity but with caution
                 strategy = "vertical_spread"
-                spread_type = "bear_call" if vix_change_1d > 0 else "bull_put"
-                self.logger.info(f"Moderately high volatility with expansion - selecting {spread_type} spreads")
-            elif iv_hv_ratio > 1.3:  # Strong premium available
-                # Iron condors perform well when IV is elevated relative to HV
-                strategy = "iron_condor"
-                self.logger.info("Moderately high volatility with elevated IV/HV ratio - selecting iron condors")
+                # In flat high volatility, slight bias to put side as markets often recover
+                spread_type = "bull_put"
+                self.logger.info(f"High volatility with flat VIX and high IV/HV - selecting bull put spreads")
             else:
-                # Default to vertical spreads in moderate-high volatility for better risk control
-                strategy = "vertical_spread"
-                spread_type = "bull_put"  # Bullish bias when volatility is moderately high
-                self.logger.info("Moderately high volatility - selecting bull put spreads by default")
-        else:
-            # In normal to low volatility environments
-            if iv_hv_ratio > 1.5:  # Very strong premium available
-                # Iron condors to capture premium from both sides
-                strategy = "iron_condor"
-                self.logger.info("Normal volatility with very high IV/HV ratio - selecting iron condors")
-            elif iv_hv_ratio > 1.2:
-                # Still enough premium for iron condors
-                strategy = "iron_condor"
-                self.logger.info("Normal volatility with good IV/HV ratio - selecting iron condors")
-            else:
-                # Not enough premium for iron condors, try vertical spreads
-                strategy = "vertical_spread"
-                # Determine direction based on recent VIX movement
-                spread_type = "bear_call" if vix_change_1d > 0.3 else "bull_put"
-                self.logger.info(f"Normal volatility with lower premium - selecting {spread_type} spreads")
+                # Not enough edge in high volatility without clear direction or premium
+                strategy = None
+                self.logger.info(f"High volatility without clear direction or sufficient premium - no trade")
         
-        # Execute the selected strategy
+        elif volatility_state == 'normal':
+            # Normal volatility (VIX 18-25)
+            if iv_hv_ratio > 1.5:
+                # Very high IV/HV ratio - excellent premium harvesting opportunity
+                strategy = "iron_condor"
+                self.logger.info(f"Normal volatility with very high IV/HV ratio ({iv_hv_ratio:.2f}) - selecting iron condors")
+            elif iv_hv_ratio > 1.3:
+                # Good IV/HV ratio - still good for iron condors
+                strategy = "iron_condor"
+                self.logger.info(f"Normal volatility with good IV/HV ratio ({iv_hv_ratio:.2f}) - selecting iron condors")
+            elif iv_hv_ratio > 1.2 and vix_trend in ('up', 'strong_up'):
+                # Rising volatility with decent IV/HV - vertical spreads
+                strategy = "vertical_spread"
+                spread_type = "bear_call"  # Bearish bias when volatility is rising
+                self.logger.info(f"Normal volatility with rising VIX - selecting bear call spreads")
+            elif iv_hv_ratio > 1.2 and vix_trend in ('down', 'strong_down'):
+                # Falling volatility with decent IV/HV - vertical spreads
+                strategy = "vertical_spread"
+                spread_type = "bull_put"  # Bullish bias when volatility is falling
+                self.logger.info(f"Normal volatility with falling VIX - selecting bull put spreads")
+            else:
+                # Not enough premium edge
+                strategy = None
+                self.logger.info(f"Normal volatility without sufficient premium (IV/HV: {iv_hv_ratio:.2f}) - no trade")
+        
+        elif volatility_state == 'low':
+            # Low volatility (VIX 13-18)
+            if iv_hv_ratio > 1.4:
+                # Very high IV/HV ratio despite low vol - good for iron condors
+                strategy = "iron_condor"
+                self.logger.info(f"Low volatility with high IV/HV ratio ({iv_hv_ratio:.2f}) - selecting iron condors")
+            elif vix_trend in ('up', 'strong_up') and iv_hv_ratio > 1.25:
+                # Rising volatility from low levels with decent premium
+                strategy = "vertical_spread"
+                spread_type = "bear_call"  # Bearish bias with rising volatility
+                self.logger.info(f"Low but rising volatility - selecting bear call spreads")
+            else:
+                # Not enough edge in low volatility
+                strategy = None
+                self.logger.info(f"Low volatility without sufficient edge - no trade")
+        
+        else:  # very_low
+            # Very low volatility (VIX < 13)
+            if iv_hv_ratio > 1.5:
+                # Extremely high IV/HV ratio despite very low vol - rare opportunity
+                strategy = "iron_condor"
+                self.logger.info(f"Very low volatility with very high IV/HV ratio ({iv_hv_ratio:.2f}) - selecting iron condors")
+            else:
+                # Generally avoid trading in very low volatility
+                strategy = None
+                self.logger.info(f"Very low volatility - insufficient premium for trading")
+        
+        # Execute the selected strategy with minimum requirements
         if strategy == "iron_condor":
             trade_decision = self.generate_iron_condor_trade(
-                option_chain, current_price, account_value, vix_analysis
+                option_chain, current_price, account_value, vix_analysis,
+                min_credit=min_credit_threshold, min_return_on_risk=min_return_on_risk
             )
+            
+            # Verify the trade meets our minimum requirements
+            if trade_decision['action'] != 'none':
+                # Evaluate the trade quality
+                trade_data = {
+                    'net_credit': trade_decision.get('net_credit', 0),
+                    'max_loss': trade_decision.get('max_loss', float('inf')),
+                    'prob_profit': trade_decision.get('prob_profit', 0),
+                    'days_to_expiry': trade_decision.get('days_to_expiry', 30),
+                    'width': trade_decision.get('width', 0),
+                    'iv': vol_harvest_analysis.get('implied_volatility', 0),
+                    'iv_hv_ratio': iv_hv_ratio
+                }
+                
+                trade_score = self._evaluate_trade(trade_data)
+                trade_decision['trade_score'] = trade_score
+                
+                # Only execute trades with a minimum score
+                if trade_score < 60:
+                    self.logger.info(f"Iron condor trade score too low ({trade_score:.1f}) - no trade")
+                    trade_decision = {'action': 'none', 'reason': 'low_trade_score'}
+                else:
+                    self.logger.info(f"Iron condor trade score: {trade_score:.1f} - executing trade")
+            
             return trade_decision
+            
         elif strategy == "vertical_spread" and spread_type is not None:
             trade_decision = self.generate_vertical_spread_trade(
-                option_chain, current_price, account_value, vix_analysis, spread_type
+                option_chain, current_price, account_value, vix_analysis, spread_type,
+                min_credit=min_credit_threshold, min_return_on_risk=min_return_on_risk
             )
+            
+            # Verify the trade meets our minimum requirements
+            if trade_decision['action'] != 'none':
+                # Evaluate the trade quality
+                trade_data = {
+                    'net_credit': trade_decision.get('net_credit', 0),
+                    'max_loss': trade_decision.get('max_loss', float('inf')),
+                    'prob_profit': trade_decision.get('prob_profit', 0),
+                    'days_to_expiry': trade_decision.get('days_to_expiry', 30),
+                    'width': trade_decision.get('width', 0),
+                    'iv': vol_harvest_analysis.get('implied_volatility', 0),
+                    'iv_hv_ratio': iv_hv_ratio
+                }
+                
+                trade_score = self._evaluate_trade(trade_data)
+                trade_decision['trade_score'] = trade_score
+                
+                # Only execute trades with a minimum score
+                if trade_score < 65:  # Slightly higher threshold for vertical spreads
+                    self.logger.info(f"Vertical spread trade score too low ({trade_score:.1f}) - no trade")
+                    trade_decision = {'action': 'none', 'reason': 'low_trade_score'}
+                else:
+                    self.logger.info(f"Vertical spread trade score: {trade_score:.1f} - executing trade")
+            
             return trade_decision
         else:
-            # Fallback to iron condors if something went wrong in strategy selection
-            self.logger.warning(f"Strategy selection issue, falling back to iron condors")
-            trade_decision = self.generate_iron_condor_trade(
-                option_chain, current_price, account_value, vix_analysis
-            )
+            # No suitable strategy selected
+            self.logger.info("No suitable strategy selected based on current market conditions")
+            return {
+                'action': 'none',
+                'reason': 'unfavorable_market_conditions'
+            }
             return trade_decision
                        
         self.last_trade_time = datetime.now()
@@ -1469,7 +1575,9 @@ class OptionsStrategy:
         option_chain: Dict, 
         current_price: float,
         account_value: float,
-        vix_analysis: Dict
+        vix_analysis: Dict,
+        min_credit: float = 0.10,
+        min_return_on_risk: float = 8.0
     ) -> Dict:
         """
         Generate an iron condor trade decision.
@@ -1479,12 +1587,19 @@ class OptionsStrategy:
             current_price: Current price of the underlying
             account_value: Current account value
             vix_analysis: VIX analysis data
+            min_credit: Minimum credit required per spread
+            min_return_on_risk: Minimum return on risk percentage
             
         Returns:
             Dictionary with trade decision
         """
         # Find iron condor legs
-        iron_condor = self.find_iron_condor_legs(option_chain, current_price)
+        iron_condor = self.find_iron_condor_legs(
+            option_chain, 
+            current_price,
+            min_credit=min_credit,
+            min_return_on_risk=min_return_on_risk
+        )
         
         if not iron_condor:
             self.logger.info("No suitable iron condor found")
@@ -1501,16 +1616,22 @@ class OptionsStrategy:
         # More conservative position sizing with further reduction
         position_size_multiplier = 0.0
         if vol_harvest_analysis['signal'] == 'strong_volatility_harvest':
-            position_size_multiplier = 0.7  # Reduced from 0.8
+            position_size_multiplier = 0.6  # Reduced from 0.7
         elif vol_harvest_analysis['signal'] == 'volatility_harvest':
-            position_size_multiplier = 0.4  # Reduced from 0.5
+            position_size_multiplier = 0.35  # Reduced from 0.4
         else:
-            position_size_multiplier = 0.2  # Reduced from 0.3
+            position_size_multiplier = 0.15  # Reduced from 0.2
+        
+        # Apply an additional safety factor based on the volatility regime
+        volatility_state = vix_analysis.get('volatility_state', 'normal')
+        if volatility_state == 'extreme':
+            position_size_multiplier *= 0.5  # Further reduce by 50% in extreme volatility
+        elif volatility_state == 'high':
+            position_size_multiplier *= 0.7  # Further reduce by 30% in high volatility
         
         # Additional check for return on risk - higher threshold for better risk/reward
-        min_return_on_risk = 0.18  # Increased from 0.15
         if iron_condor['return_on_risk'] < min_return_on_risk:
-            self.logger.info(f"Iron condor return on risk too low: {iron_condor['return_on_risk']:.2f} < {min_return_on_risk:.2f}")
+            self.logger.info(f"Iron condor return on risk too low: {iron_condor['return_on_risk']:.2f}% < {min_return_on_risk:.2f}%")
             return {
                 'action': 'none',
                 'reason': 'insufficient_return_on_risk',
@@ -1519,7 +1640,6 @@ class OptionsStrategy:
             }
             
         # Additional check for minimum credit - ensure enough premium is collected
-        min_credit = 0.25  # Increased from 0.20
         if iron_condor['net_credit'] < min_credit:
             self.logger.info(f"Iron condor net credit too low: {iron_condor['net_credit']:.2f} < {min_credit:.2f}")
             return {
@@ -1530,13 +1650,22 @@ class OptionsStrategy:
             }
         
         # Check for credit-to-risk ratio - ensure the credit is a meaningful percentage of the risk
-        min_credit_risk_ratio = 0.18  # Minimum 18% of width
-        if iron_condor.get('credit_to_risk_ratio', 0) < min_credit_risk_ratio:
-            self.logger.info(f"Iron condor credit-to-risk ratio too low: {iron_condor.get('credit_to_risk_ratio', 0):.2f} < {min_credit_risk_ratio:.2f}")
+        min_credit_risk_ratio = 0.15  # Minimum 15% of width
+        current_credit_risk_ratio = iron_condor.get('credit_to_risk_ratio', 0)
+        
+        # Adjust minimum credit risk ratio based on volatility state
+        volatility_state = vix_analysis.get('volatility_state', 'normal')
+        if volatility_state == 'extreme':
+            min_credit_risk_ratio = 0.20  # Require higher ratio in extreme volatility
+        elif volatility_state == 'high':
+            min_credit_risk_ratio = 0.17  # Require higher ratio in high volatility
+            
+        if current_credit_risk_ratio < min_credit_risk_ratio:
+            self.logger.info(f"Iron condor credit-to-risk ratio too low: {current_credit_risk_ratio:.2f} < {min_credit_risk_ratio:.2f}")
             return {
                 'action': 'none',
                 'reason': 'insufficient_credit_risk_ratio',
-                'credit_risk_ratio': iron_condor.get('credit_to_risk_ratio', 0),
+                'credit_risk_ratio': current_credit_risk_ratio,
                 'threshold': min_credit_risk_ratio
             }
             
