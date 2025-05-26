@@ -212,58 +212,199 @@ class OptionsStrategy:
         option_type = option.get('type', 'call')
         bid = option.get('bid', 0)
         ask = option.get('ask', 0)
+        open_interest = option.get('open_interest', 0)
+        volume = option.get('volume', 0)
+        delta = abs(option.get('delta', 0))
         
         # Calculate mid price
         mid_price = (bid + ask) / 2 if bid > 0 and ask > 0 else 0
         
         # Calculate score components
         
-        # 1. IV Score (higher IV = higher score, max 30 points)
-        # But not too high (>100% IV might be problematic)
-        iv_score = min(30, iv / 2) if iv <= 60 else max(0, 30 - (iv - 60) / 3)
-        
-        # 2. DTE Score (sweet spot around 14-28 days, max 25 points)
-        if dte < 5:
-            dte_score = dte * 3  # Quickly increasing
-        elif 5 <= dte < 14:
-            dte_score = 15 + (dte - 5)  # Gradually increasing
-        elif 14 <= dte <= 28:
-            dte_score = 25  # Optimal range
+        # 1. IV Score (higher IV = higher score, but with a more optimal curve, max 25 points)
+        # Prefer IV in the 30-60% range, penalize very low or very high IV
+        if iv < 15:
+            # Too low IV doesn't provide enough premium
+            iv_score = iv * 0.5
+        elif 15 <= iv <= 30:
+            # Growing score as IV approaches optimal range
+            iv_score = 7.5 + (iv - 15) * 0.7
+        elif 30 < iv <= 60:
+            # Optimal IV range
+            iv_score = 18 + (iv - 30) * 0.23
+        elif 60 < iv <= 80:
+            # Still good but starting to get risky
+            iv_score = 25 - (iv - 60) * 0.25
         else:
-            dte_score = max(0, 25 - (dte - 28) / 3)  # Gradually decreasing
+            # Very high IV is often a warning sign
+            iv_score = max(0, 20 - (iv - 80) * 0.4)
+        
+        # 2. DTE Score (sweet spot around 21-45 days, max 20 points)
+        # Adjusted to prefer slightly longer-dated options
+        if dte < 7:
+            # Too close to expiration - high gamma risk
+            dte_score = max(0, dte * 1.5)
+        elif 7 <= dte < 21:
+            # Approaching ideal range
+            dte_score = 10 + (dte - 7) * 0.5
+        elif 21 <= dte <= 45:
+            # Optimal range - best theta decay vs. capital efficiency
+            dte_score = 20
+        elif 45 < dte <= 60:
+            # Still good but capital tied up longer
+            dte_score = 20 - (dte - 45) * 0.3
+        else:
+            # Too far from expiration - reduced time decay benefits
+            dte_score = max(0, 15 - (dte - 60) * 0.1)
             
-        # 3. Strike Distance Score (based on volatility state, max 25 points)
+        # 3. Strike Distance Score (based on volatility state, max 20 points)
         # Calculate moneyness (how far strike is from current price)
         moneyness = abs((strike / current_price) - 1.0) * 100
         
         # Ideal moneyness depends on volatility state
         if self.volatility_state == 'extreme':
-            ideal_moneyness = 8.0
+            # Further OTM in extreme volatility
+            ideal_moneyness = 10.0
         elif self.volatility_state == 'high':
-            ideal_moneyness = 5.0
+            # Further OTM in high volatility
+            ideal_moneyness = 7.0
         elif self.volatility_state == 'normal':
-            ideal_moneyness = 3.0
+            # Moderately OTM in normal volatility
+            ideal_moneyness = 4.0
         else:  # Low volatility or unknown
-            ideal_moneyness = 2.0
+            # Closer to ATM in low volatility
+            ideal_moneyness = 2.5
             
         # Score based on how close to ideal moneyness
-        strike_score = max(0, 25 - abs(moneyness - ideal_moneyness) * 2)
+        strike_score = max(0, 20 - abs(moneyness - ideal_moneyness) * 1.8)
         
-        # 4. Liquidity Score (based on bid-ask spread, max 20 points)
+        # 4. Liquidity Score (improved calculation, max 15 points)
+        liquidity_score = 0
         if mid_price > 0:
+            # Bid-ask spread component
             spread_pct = (ask - bid) / mid_price
-            liquidity_score = max(0, 20 - spread_pct * 100)
-        else:
-            liquidity_score = 0
+            spread_score = max(0, 10 - spread_pct * 100)
             
+            # Volume component
+            volume_score = min(5, volume / 200)
+            
+            liquidity_score = spread_score + volume_score
+        
+        # 5. Open Interest Score (new component, max 10 points)
+        # Higher open interest indicates more market participants and better liquidity
+        oi_score = min(10, open_interest / 500)
+        
+        # 6. Risk-Reward Score (new component, max 10 points)
+        risk_reward_score = 0
+        if delta > 0:
+            # For OTM options (which is what we mostly trade)
+            # Lower delta (more OTM) should have better risk-reward for selling
+            if delta < 0.2:
+                risk_reward_score = 10
+            elif delta < 0.3:
+                risk_reward_score = 8
+            elif delta < 0.4:
+                risk_reward_score = 5
+            elif delta < 0.5:
+                risk_reward_score = 3
+            else:
+                risk_reward_score = 1
+        
         # Calculate total score (max 100)
-        total_score = iv_score + dte_score + strike_score + liquidity_score
+        total_score = iv_score + dte_score + strike_score + liquidity_score + oi_score + risk_reward_score
         
         # Log score components for debugging
         self.logger.debug(f"Option score components - IV: {iv_score:.1f}, DTE: {dte_score:.1f}, "
                         f"Strike: {strike_score:.1f}, Liquidity: {liquidity_score:.1f}, "
+                        f"OI: {oi_score:.1f}, Risk/Reward: {risk_reward_score:.1f}, "
                         f"Total: {total_score:.1f}")
                         
+        return total_score
+    
+    def _evaluate_trade(self, trade_data: Dict) -> float:
+        """
+        Evaluate a potential trade based on risk/reward and market conditions.
+        
+        Args:
+            trade_data: Dictionary containing trade information
+                - net_credit: Net credit received for the trade
+                - max_loss: Maximum possible loss
+                - prob_profit: Probability of profit (0-100)
+                - days_to_expiry: Days to expiration
+                - width: Width of the spread in points
+                - iv: Implied volatility
+                - iv_hv_ratio: IV to HV ratio
+        
+        Returns:
+            float: Trade score from 0.0 to 100.0 (higher is better)
+        """
+        # Extract trade parameters
+        net_credit = trade_data.get('net_credit', 0)
+        max_loss = trade_data.get('max_loss', float('inf'))
+        prob_profit = trade_data.get('prob_profit', 0)
+        days_to_expiry = trade_data.get('days_to_expiry', 30)
+        width = trade_data.get('width', 0)
+        iv = trade_data.get('iv', 0) * 100  # Convert to percentage
+        iv_hv_ratio = trade_data.get('iv_hv_ratio', 1.0)
+        
+        # If critical data is missing or invalid, return low score
+        if net_credit <= 0 or max_loss <= 0 or width <= 0:
+            return 0
+        
+        # Calculate trade metrics
+        return_on_risk = (net_credit / max_loss) * 100
+        risk_reward_ratio = max_loss / net_credit
+        daily_return_rate = return_on_risk / days_to_expiry
+        
+        # 1. Return on Risk Score (max 30 points)
+        # Higher return on risk is better
+        if return_on_risk < 5:
+            ror_score = return_on_risk * 2  # Low returns score poorly
+        elif 5 <= return_on_risk < 15:
+            ror_score = 10 + (return_on_risk - 5) * 1.5  # Moderate returns
+        else:
+            ror_score = 25 + min(5, (return_on_risk - 15) * 0.5)  # High returns (capped)
+        
+        # 2. Probability of Profit Score (max 25 points)
+        # Higher probability of profit is better
+        pop_score = min(25, prob_profit * 0.25)
+        
+        # 3. Risk-Reward Ratio Score (max 20 points)
+        # Lower risk-reward ratio is better (we want to risk less to make more)
+        if risk_reward_ratio > 10:
+            rr_score = 0  # Too much risk
+        elif 5 < risk_reward_ratio <= 10:
+            rr_score = 5  # High risk
+        elif 3 < risk_reward_ratio <= 5:
+            rr_score = 10  # Moderate risk
+        elif 2 < risk_reward_ratio <= 3:
+            rr_score = 15  # Good risk-reward
+        else:
+            rr_score = 20  # Excellent risk-reward
+        
+        # 4. Daily Return Rate Score (max 15 points)
+        # Higher daily return rate is better
+        daily_score = min(15, daily_return_rate * 3)
+        
+        # 5. IV/HV Ratio Score (max 10 points)
+        # Higher IV/HV ratio is better for selling options
+        if iv_hv_ratio < 1.0:
+            iv_hv_score = 0  # IV less than HV is not good for selling
+        elif 1.0 <= iv_hv_ratio < 1.2:
+            iv_hv_score = iv_hv_ratio * 5  # Adequate
+        elif 1.2 <= iv_hv_ratio < 1.5:
+            iv_hv_score = 6 + (iv_hv_ratio - 1.2) * 10  # Good
+        else:
+            iv_hv_score = 9 + min(1, (iv_hv_ratio - 1.5) * 2)  # Excellent (capped)
+        
+        # Calculate total score
+        total_score = ror_score + pop_score + rr_score + daily_score + iv_hv_score
+        
+        # Log score components
+        self.logger.debug(f"Trade evaluation - Return on Risk: {ror_score:.1f}, Prob of Profit: {pop_score:.1f}, "
+                        f"Risk-Reward: {rr_score:.1f}, Daily Return: {daily_score:.1f}, "
+                        f"IV/HV: {iv_hv_score:.1f}, Total: {total_score:.1f}")
+        
         return total_score
     
     def generate_trade_decision(
