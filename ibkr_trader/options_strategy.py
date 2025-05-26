@@ -1322,6 +1322,8 @@ class OptionsStrategy:
         self.todays_trades.append(trade_decision)
         
         return trade_decision
+    
+    def generate_iron_condor_trade(
         self, 
         option_chain: Dict, 
         current_price: float,
