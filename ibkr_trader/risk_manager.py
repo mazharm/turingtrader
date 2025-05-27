@@ -111,34 +111,52 @@ class RiskManager:
         if self.max_daily_risk_amount == 0.0:
             self.update_account_value(account_value)
             
-        # Base position size as percentage of max position size - reduced multiplier for safety
-        base_size = self.max_position_size * (vol_multiplier * 0.85)
+        # Apply additional safety factor that reduces all position sizes
+        global_safety_factor = 0.75  # Reduce all positions by 25%
         
-        # Adjust for volatility - more conservative scaling for all volatility levels
-        if volatility > 50:
-            vol_factor = 0.2  # Extremely high volatility - reduce position size drastically
+        # Base position size as percentage of max position size - reduced multiplier for safety
+        base_size = self.max_position_size * (vol_multiplier * 0.8) * global_safety_factor
+        
+        # More conservative volatility-based scaling with finer gradations
+        if volatility > 60:
+            vol_factor = 0.1  # Extreme volatility crisis - tiny positions
+        elif volatility > 50:
+            vol_factor = 0.15  # Extremely high volatility - drastically reduced
         elif volatility > 40:
-            vol_factor = 0.3  # Very high volatility - reduce position size significantly
+            vol_factor = 0.25  # Very high volatility - significantly reduced
+        elif volatility > 35:
+            vol_factor = 0.35  # High volatility - substantially reduced
         elif volatility > 30:
-            vol_factor = 0.5  # Above average volatility - reduce position size moderately
+            vol_factor = 0.45  # Above average volatility - moderately reduced
+        elif volatility > 25:
+            vol_factor = 0.6   # Slightly elevated volatility - somewhat reduced
         elif volatility > 20:
-            vol_factor = 0.7  # Normal volatility - still apply moderate reduction
+            vol_factor = 0.7   # Normal volatility - mild reduction
         elif volatility > 15:
-            vol_factor = 0.8  # Optimal volatility range - apply slight reduction
+            vol_factor = 0.8   # Optimal volatility range - slight reduction
+        elif volatility > 12:
+            vol_factor = 0.7   # Lower volatility - reduced as premium may be inadequate
         else:
-            vol_factor = 0.5  # Low volatility - reduce position size as premiums are likely too small
+            vol_factor = 0.4   # Very low volatility - substantially reduced due to minimal premium
             
-        # Calculate dollar amount - even more conservative cap to prevent large positions
-        position_value = min(base_size * vol_factor, account_value * 0.08)  # Reduced from 0.10
+        # Calculate dollar amount with more conservative position cap
+        position_value = min(base_size * vol_factor, account_value * 0.06)  # Reduced from 0.08
         
         # Convert to quantity
         quantity = int(position_value / price)
         
+        # Apply an absolute maximum based on price
+        if price > 0:
+            # Limit by absolute dollar amount
+            max_dollar_amount = 5000.0  # Maximum $5,000 per position
+            max_quantity_by_dollars = int(max_dollar_amount / price)
+            quantity = min(quantity, max_quantity_by_dollars)
+        
         self.logger.info(f"Calculated position size: {quantity} units "
                        f"(${position_value:.2f}, {vol_multiplier:.2f} vol mult, "
-                       f"{vol_factor:.2f} vol factor)")
+                       f"{vol_factor:.2f} vol factor, {global_safety_factor:.2f} safety)")
                        
-        return max(1, quantity)  # Ensure at least 1 unit
+        return max(0, quantity)  # Allow zero quantity for extreme cases
     
     def calculate_option_quantity(self, 
                                 option_price: float,
@@ -167,23 +185,32 @@ class RiskManager:
         if self.max_daily_risk_amount == 0.0:
             self.update_account_value(account_value)
             
-        # Base position value as percentage of max position size - significantly reduced for safety
-        base_size = (self.max_position_size * vol_multiplier) * 0.7  # Reduced from 0.8
+        # Apply global safety factor for additional risk reduction
+        global_safety_factor = 0.65  # Reduce all option positions by 35%
         
-        # Improved delta-based adjustment with more conservative scaling
-        if abs_delta > 0.7:  # Deep ITM options
-            delta_factor = min(0.2, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.3
-        elif abs_delta > 0.4:  # Moderate delta
-            delta_factor = min(0.3, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.5
-        elif abs_delta > 0.2:  # Standard delta range for many strategies
-            delta_factor = min(0.5, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.7
-        elif abs_delta > 0.05:  # Lower delta (OTM options)
-            delta_factor = min(0.4, self.max_delta_exposure / (100 * abs_delta))  # Reduced from 0.6
-        else:  # Very low delta (far OTM options)
-            delta_factor = 0.2  # Reduced from 0.3
-            
+        # Base position value as percentage of max position size - further reduced for safety
+        base_size = (self.max_position_size * vol_multiplier) * 0.6 * global_safety_factor  # Reduced from 0.7
+        
+        # Much more conservative delta-based adjustment with finer gradations
+        if abs_delta > 0.8:  # Deep ITM options
+            delta_factor = min(0.1, self.max_delta_exposure / (100 * abs_delta))  # Extremely small
+        elif abs_delta > 0.6:  # Moderately ITM options
+            delta_factor = min(0.15, self.max_delta_exposure / (100 * abs_delta))  # Very small
+        elif abs_delta > 0.4:  # ATM options
+            delta_factor = min(0.25, self.max_delta_exposure / (100 * abs_delta))  # Small
+        elif abs_delta > 0.3:  # Slightly OTM options
+            delta_factor = min(0.35, self.max_delta_exposure / (100 * abs_delta))  # Moderate
+        elif abs_delta > 0.2:  # OTM options - our sweet spot for most trades
+            delta_factor = min(0.45, self.max_delta_exposure / (100 * abs_delta))  # Optimal range
+        elif abs_delta > 0.1:  # Further OTM options
+            delta_factor = min(0.35, self.max_delta_exposure / (100 * abs_delta))  # Moderate
+        elif abs_delta > 0.05:  # Very OTM options
+            delta_factor = min(0.25, self.max_delta_exposure / (100 * abs_delta))  # Small again
+        else:  # Extremely OTM options
+            delta_factor = 0.1  # Very small due to high gamma risk and low probability
+        
         # Calculate dollar amount with maximum position cap - significantly reduced cap
-        position_value = min(base_size * delta_factor, account_value * 0.05)  # Reduced from 0.07
+        position_value = min(base_size * delta_factor, account_value * 0.04)  # Reduced from 0.05
         
         # Options have multiplier (usually 100)
         contract_value = option_price * 100
@@ -191,22 +218,33 @@ class RiskManager:
         # Calculate number of contracts with better risk control
         if contract_value > 0:
             # Limit the number of contracts based on absolute risk - more conservative
-            max_contracts_by_risk = int((account_value * (self.risk_params.max_daily_risk_pct / 100 * 0.7)) / contract_value)  # Reduced factor from 0.8
-            quantity = min(int(position_value / contract_value), max_contracts_by_risk)
+            # Use a lower percentage of daily risk for each individual position
+            daily_risk_allocation = self.risk_params.max_daily_risk_pct / 100
+            position_risk_allocation = daily_risk_allocation * 0.5  # Only use 50% of daily risk on a single position
+            max_contracts_by_risk = int((account_value * position_risk_allocation) / contract_value)
+            
+            # Further limit based on absolute value
+            max_dollar_exposure = 2000.0  # Maximum $2,000 per option position
+            max_contracts_by_dollars = int(max_dollar_exposure / contract_value)
+            
+            # Take the minimum of all constraints
+            quantity = min(
+                int(position_value / contract_value),
+                max_contracts_by_risk,
+                max_contracts_by_dollars,
+                10  # Hard cap on number of contracts
+            )
         else:
             quantity = 0
             
         self.logger.info(f"Calculated option quantity: {quantity} contracts "
                        f"(${position_value:.2f}, delta: {abs_delta:.2f}, "
-                       f"contract value: ${contract_value:.2f})")
+                       f"contract value: ${contract_value:.2f}, safety: {global_safety_factor:.2f})")
         
-        # For very expensive options, ensure we take at least one contract if we can afford it
-        # but only if it doesn't exceed a reasonable percentage of account
-        if quantity == 0 and contract_value <= account_value * 0.02:  # Reduced from 0.03
-            quantity = 1
-            self.logger.info(f"Adjusted to minimum 1 contract due to affordability check")
-                       
-        return quantity  # No longer enforcing minimum 1 contract
+        # For expensive options, we no longer force a minimum of 1 contract
+        # This allows the algorithm to skip trades when they're too expensive
+                
+        return quantity  # Allow zero quantity for better risk management
     
     def update_daily_pnl(self, trade_pnl: float) -> bool:
         """

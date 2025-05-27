@@ -93,26 +93,31 @@ class RiskParameters:
         # Scale parameters according to risk level
         self.risk_level = level
         
-        # Lower risk means higher volatility threshold for entry - made more selective across all levels
-        self.min_volatility_threshold = 22 + (10 - level) * 2.0  # Increased from 20 + (10 - level) * 1.8
+        # Lower risk means higher volatility threshold for entry - made even more selective
+        self.min_volatility_threshold = 25 + (10 - level) * 2.5  # Increased from 22 + (10 - level) * 2.0
         
-        # Lower risk means lower daily risk - more conservative across all levels
-        self.max_daily_risk_pct = 0.3 + level * 0.2  # Reduced from 0.4 + level * 0.25
+        # Lower risk means lower daily risk - substantially more conservative
+        self.max_daily_risk_pct = 0.2 + level * 0.15  # Reduced from 0.3 + level * 0.2
         
-        # Lower risk means smaller position size - reduced for better risk management
-        self.max_position_size_pct = 1.5 + level * 1.2   # Reduced from 2 + level * 1.5
+        # Lower risk means smaller position size - significantly reduced across all levels
+        self.max_position_size_pct = 1.2 + level * 0.8   # Reduced from 1.5 + level * 1.2
         
-        # Lower risk means lower delta exposure - significantly reduced exposure
-        self.max_delta_exposure = 4 + level * 3  # Reduced from 5 + level * 4
+        # Lower risk means lower delta exposure - dramatically reduced exposure
+        self.max_delta_exposure = 3 + level * 2  # Reduced from 4 + level * 3
         
         # Lower risk means tighter stop loss - improved to prevent larger drawdowns
-        self.stop_loss_pct = 6 + level * 1.0  # Reduced from 8 + level * 1.2
+        self.stop_loss_pct = 5 + level * 0.8  # Reduced from 6 + level * 1.0
         
         # Lower risk means lower but more achievable target profit - more realistic targets
-        self.target_profit_pct = 10 + level * 1.2  # Reduced from 12 + level * 1.5
+        self.target_profit_pct = 8 + level * 1.0  # Reduced from 10 + level * 1.2
         
         # Lower risk means requiring larger volatility changes to trade - more selective entry
-        self.min_volatility_change = 4.0 - (level * 0.15)  # Increased from 3.5 - (level * 0.2)
+        self.min_volatility_change = 5.0 - (level * 0.15)  # Increased from 4.0 - (level * 0.15)
+        
+        # Adjust Iron Condor risk parameters based on risk level
+        # Higher risk levels allow wider stop losses and higher profit targets
+        self.condor_stop_loss_factor_of_max_risk = 30.0 + level * 2.0  # Tighter stops for all levels
+        self.condor_profit_target_factor_of_credit = 90.0 - level * 1.0  # Take profits earlier at lower risk levels
         
         # Iron Condor specific adjustments
         # More conservative stop loss for all risk levels

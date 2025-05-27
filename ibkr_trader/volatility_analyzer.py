@@ -220,7 +220,9 @@ class VolatilityAnalyzer:
                 'vix_change_1d': 0.0,
                 'vix_change_5d': 0.0,
                 'volatility_state': 'unknown',
-                'signal': 'none'
+                'signal': 'none',
+                'vix_regime': 'unknown',
+                'vix_trend': 'flat'
             }
             
         try:
@@ -240,57 +242,100 @@ class VolatilityAnalyzer:
             # Calculate changes
             vix_change_1d = 0.0 if len(vix_values) < 2 else current_vix - vix_values[-2]
             vix_change_5d = 0.0 if len(vix_values) < 6 else current_vix - vix_values[-6]
+            vix_change_10d = 0.0 if len(vix_values) < 11 else current_vix - vix_values[-11]
             
             vix_change_pct_1d = 0.0 if len(vix_values) < 2 else 100 * (vix_change_1d / vix_values[-2])
             vix_change_pct_5d = 0.0 if len(vix_values) < 6 else 100 * (vix_change_5d / vix_values[-6])
+            vix_change_pct_10d = 0.0 if len(vix_values) < 11 else 100 * (vix_change_10d / vix_values[-11])
             
             # Calculate simple moving averages
             vix_sma_5 = np.mean(vix_values[-5:]) if len(vix_values) >= 5 else current_vix
+            vix_sma_10 = np.mean(vix_values[-10:]) if len(vix_values) >= 10 else current_vix
             vix_sma_20 = np.mean(vix_values[-20:]) if len(vix_values) >= 20 else current_vix
             
-            # Determine volatility state
-            if current_vix > 30:
+            # Enhanced volatility state determination
+            if current_vix > 35:
                 volatility_state = 'extreme'
-            elif current_vix > 20:
+            elif current_vix > 25:
                 volatility_state = 'high'
-            elif current_vix > 15:
+            elif current_vix > 18:
                 volatility_state = 'normal'
-            else:
+            elif current_vix > 13:
                 volatility_state = 'low'
+            else:
+                volatility_state = 'very_low'
+            
+            # Determine VIX regime (longer-term view)
+            if vix_sma_20 > 30:
+                vix_regime = 'crisis'
+            elif vix_sma_20 > 22:
+                vix_regime = 'high_volatility'
+            elif vix_sma_20 > 16:
+                vix_regime = 'normal'
+            else:
+                vix_regime = 'low_volatility'
                 
-            # Determine signal based on VIX and changes
+            # Determine VIX trend
+            # Look at both short-term and medium-term trends
+            if vix_sma_5 > vix_sma_10 and vix_change_pct_5d > 8:
+                vix_trend = 'strong_up'
+            elif vix_sma_5 > vix_sma_10:
+                vix_trend = 'up'
+            elif vix_sma_5 < vix_sma_10 and vix_change_pct_5d < -8:
+                vix_trend = 'strong_down'
+            elif vix_sma_5 < vix_sma_10:
+                vix_trend = 'down'
+            else:
+                vix_trend = 'flat'
+            
+            # Enhanced signal determination based on VIX state, regime, and trend
             signal = 'none'
             
-            # Higher than threshold and rising
-            if (current_vix >= self.min_volatility_threshold and 
-                vix_change_pct_1d >= self.min_volatility_change):
-                signal = 'strong_buy'
-            # Higher than threshold but not rising enough
-            elif (current_vix >= self.min_volatility_threshold and 
-                 vix_change_pct_1d > 0):
-                signal = 'buy'
-            # Below threshold but rapidly rising
-            elif (current_vix < self.min_volatility_threshold and 
-                 vix_change_pct_1d >= self.min_volatility_change * 1.5):
-                signal = 'buy'
-            # Above threshold but falling
-            elif (current_vix >= self.min_volatility_threshold and 
-                 vix_change_pct_1d < 0):
-                signal = 'hold'
-            # Below threshold and not changing enough
-            else:
-                signal = 'cash'
+            # Base signal on volatility level, trend, and the relationship between short and longer-term VIX
+            if volatility_state in ('extreme', 'high'):
+                # In high volatility environments, we look for stabilization or decline
+                if vix_trend == 'strong_down':
+                    signal = 'strong_buy'  # Volatility dropping rapidly - good time to sell premium
+                elif vix_trend == 'down':
+                    signal = 'buy'  # Volatility declining - favorable for selling premium
+                elif vix_trend == 'flat' and current_vix > vix_sma_10:
+                    signal = 'hold'  # Elevated but stable volatility - cautious premium selling
+                else:
+                    signal = 'cash'  # Volatility still increasing - stay in cash
+                    
+            elif volatility_state == 'normal':
+                # In normal volatility, we want confirmed trends
+                if vix_trend in ('up', 'strong_up') and vix_change_pct_1d > 5:
+                    signal = 'buy'  # Volatility increasing from normal levels - good for premium selling
+                elif vix_trend == 'flat' and current_vix >= self.min_volatility_threshold:
+                    signal = 'hold'  # Stable, sufficient volatility - cautious premium selling
+                else:
+                    signal = 'cash'  # Not enough volatility movement to justify trading
+                    
+            elif volatility_state in ('low', 'very_low'):
+                # In low volatility, we need strong upward moves
+                if vix_trend == 'strong_up' and vix_change_pct_1d > 8:
+                    signal = 'buy'  # Sharp volatility spike from low levels - opportunity for premium selling
+                elif vix_trend == 'up' and vix_change_pct_5d > 15:
+                    signal = 'hold'  # Sustained volatility increase - cautious premium selling
+                else:
+                    signal = 'cash'  # Volatility too low for effective premium selling
             
-            # Return analysis
+            # Return enhanced analysis
             return {
                 'current_vix': current_vix,
                 'vix_change_1d': vix_change_1d,
                 'vix_change_pct_1d': vix_change_pct_1d,
                 'vix_change_5d': vix_change_5d,
                 'vix_change_pct_5d': vix_change_pct_5d,
+                'vix_change_10d': vix_change_10d,
+                'vix_change_pct_10d': vix_change_pct_10d,
                 'vix_sma_5': vix_sma_5,
+                'vix_sma_10': vix_sma_10,
                 'vix_sma_20': vix_sma_20,
                 'volatility_state': volatility_state,
+                'vix_regime': vix_regime,
+                'vix_trend': vix_trend,
                 'signal': signal
             }
             
@@ -305,8 +350,121 @@ class VolatilityAnalyzer:
                 'error': str(e)
             }
     
-    def _calculate_opportunity_score(self, iv: float, days_to_expiry: int, volume: int, bid: float, 
-                                 ask: float = None, open_interest: int = None, spread_pct: float = None) -> float:
+    def calculate_probability_of_profit(self, 
+                                  current_price: float, 
+                                  strike_price: float, 
+                                  days_to_expiry: float, 
+                                  volatility: float, 
+                                  option_type: str = 'call',
+                                  position_type: str = 'short') -> float:
+        """
+        Calculate probability of profit for an option trade based on volatility.
+        
+        Args:
+            current_price: Current price of the underlying
+            strike_price: Strike price of the option
+            days_to_expiry: Days to expiration
+            volatility: Implied volatility (decimal)
+            option_type: 'call' or 'put'
+            position_type: 'long' or 'short'
+        
+        Returns:
+            float: Probability of profit as a percentage (0-100)
+        """
+        if days_to_expiry <= 0 or volatility <= 0:
+            return 0.0
+            
+        try:
+            # Convert inputs to the right format
+            s = current_price
+            k = strike_price
+            t = days_to_expiry / 365.0  # Convert to years
+            sigma = volatility  # Should be in decimal format (e.g., 0.25 for 25%)
+            
+            # Calculate probability based on log-normal distribution
+            if option_type.lower() == 'call':
+                if position_type.lower() == 'long':
+                    # For long calls, need price to rise above strike + premium
+                    # This is simplified and doesn't account for premium
+                    ln_ratio = math.log(s / k)
+                    probability = norm.cdf((ln_ratio + (sigma**2 / 2) * t) / (sigma * math.sqrt(t)))
+                    return probability * 100
+                else:  # short call
+                    # For short calls, need price to stay below strike
+                    ln_ratio = math.log(s / k)
+                    probability = norm.cdf(-(ln_ratio + (sigma**2 / 2) * t) / (sigma * math.sqrt(t)))
+                    return probability * 100
+            else:  # put
+                if position_type.lower() == 'long':
+                    # For long puts, need price to fall below strike - premium
+                    # This is simplified and doesn't account for premium
+                    ln_ratio = math.log(s / k)
+                    probability = norm.cdf(-(ln_ratio + (sigma**2 / 2) * t) / (sigma * math.sqrt(t)))
+                    return probability * 100
+                else:  # short put
+                    # For short puts, need price to stay above strike
+                    ln_ratio = math.log(s / k)
+                    probability = norm.cdf((ln_ratio + (sigma**2 / 2) * t) / (sigma * math.sqrt(t)))
+                    return probability * 100
+                    
+        except Exception as e:
+            self.logger.error(f"Error calculating probability of profit: {e}")
+            return 0.0
+            
+    def calculate_probability_of_profit_spread(self,
+                                           current_price: float,
+                                           short_strike: float,
+                                           long_strike: float,
+                                           days_to_expiry: float,
+                                           volatility: float,
+                                           spread_type: str) -> float:
+        """
+        Calculate probability of profit for a vertical spread or iron condor.
+        
+        Args:
+            current_price: Current price of the underlying
+            short_strike: Strike price of the short option
+            long_strike: Strike price of the long option
+            days_to_expiry: Days to expiration
+            volatility: Implied volatility (decimal)
+            spread_type: 'bull_put', 'bear_call', or 'iron_condor'
+        
+        Returns:
+            float: Probability of profit as a percentage (0-100)
+        """
+        if days_to_expiry <= 0 or volatility <= 0:
+            return 0.0
+            
+        try:
+            if spread_type == 'bull_put':
+                # For bull put spread, price needs to stay above short put strike
+                return self.calculate_probability_of_profit(
+                    current_price, short_strike, days_to_expiry, volatility, 'put', 'short')
+                    
+            elif spread_type == 'bear_call':
+                # For bear call spread, price needs to stay below short call strike
+                return self.calculate_probability_of_profit(
+                    current_price, short_strike, days_to_expiry, volatility, 'call', 'short')
+                    
+            elif spread_type == 'iron_condor':
+                # For iron condor, price needs to stay between short put and short call
+                put_prob = self.calculate_probability_of_profit(
+                    current_price, short_strike, days_to_expiry, volatility, 'put', 'short')
+                call_prob = self.calculate_probability_of_profit(
+                    current_price, long_strike, days_to_expiry, volatility, 'call', 'short')
+                
+                # The combined probability - this is a simplification as it doesn't account for correlation
+                # In reality, these aren't independent events
+                combined_prob = put_prob * call_prob / 100
+                return combined_prob
+                
+            else:
+                self.logger.warning(f"Unknown spread type: {spread_type}")
+                return 0.0
+                
+        except Exception as e:
+            self.logger.error(f"Error calculating probability of profit for spread: {e}")
+            return 0.0
         """
         Calculate a quality score for an option opportunity.
         Higher score means better opportunity.
@@ -567,46 +725,85 @@ class VolatilityAnalyzer:
         if len(self.vix_history) > 30:  # Keep last 30 days
             self.vix_history.pop(0)
             
-        # Update IV threshold based on VIX
-        # In higher volatility environments, we need higher IV for signals
-        # Made more conservative in high volatility environments
-        if current_vix > 35:
+        # Calculate VIX statistics for more nuanced adaptation
+        vix_history = np.array(self.vix_history)
+        vix_mean = np.mean(vix_history) if len(vix_history) > 0 else current_vix
+        vix_std = np.std(vix_history) if len(vix_history) > 1 else 0
+        vix_percentile = (current_vix - vix_mean) / vix_std if vix_std > 0 else 0
+        
+        # Update IV threshold based on VIX - more conservative approach with finer gradations
+        # Significantly enhanced to be more selective in all volatility ranges
+        if current_vix > 40:
+            # Severe volatility crisis - extremely conservative
+            self.adaptive_iv_threshold = self.min_iv_threshold * 2.0  # Highest threshold
+        elif current_vix > 35:
             # Extreme volatility - significantly increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.7  # Increased from 1.5
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.8  # Increased from 1.7
         elif current_vix > 30:
             # Very high volatility - substantially increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.5  # Increased from 1.4
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.6  # Increased from 1.5
         elif current_vix > 25:
             # High volatility - moderately increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.3  # Increased from 1.25
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.4  # Increased from 1.3
         elif current_vix > 20:
             # Above average volatility - slightly increase threshold
-            self.adaptive_iv_threshold = self.min_iv_threshold * 1.15  # Increased from 1.1
-        elif current_vix < 15:
-            # Low volatility - slightly decrease threshold but maintain selectivity
-            self.adaptive_iv_threshold = self.min_iv_threshold * 0.95  # Increased from 0.9
-        else:
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.2  # Increased from 1.15
+        elif current_vix > 18:
+            # Slightly above normal volatility
+            self.adaptive_iv_threshold = self.min_iv_threshold * 1.1
+        elif current_vix > 15:
             # Normal volatility - use standard threshold
             self.adaptive_iv_threshold = self.min_iv_threshold
+        elif current_vix > 12:
+            # Slightly below normal volatility - slightly decrease threshold
+            self.adaptive_iv_threshold = self.min_iv_threshold * 0.95
+        else:
+            # Very low volatility - decrease threshold but maintain selectivity
+            self.adaptive_iv_threshold = self.min_iv_threshold * 0.9
         
         # Update IV/HV ratio threshold based on VIX volatility
-        # In more volatile VIX environments, be more selective by raising threshold
+        # Become more selective as VIX becomes more volatile
         if len(self.vix_history) >= 5:
-            vix_std = np.std(self.vix_history[-5:])
-            if vix_std > 3.0:  # Extremely volatile VIX
-                # Be much more selective in extreme volatility
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.4  # Increased from 1.2
-            elif vix_std > 2.0:  # Very volatile VIX
-                # Be more selective in high volatility
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.25  # Increased from 1.1
-            elif vix_std > 1.0:  # Moderately volatile VIX
-                # Be somewhat more selective even in moderate volatility
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.1  # New level instead of 1.0
-            elif vix_std < 0.5:  # Very stable VIX
-                # Be only slightly less selective in stable markets
-                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.97  # Less reduction (from 0.95)
+            # Calculate recent VIX volatility (standard deviation)
+            recent_vix_std = np.std(self.vix_history[-5:])
+            
+            # Calculate VIX trend (positive = rising, negative = falling)
+            vix_trend = 0
+            if len(self.vix_history) >= 10:
+                vix_5d_avg = np.mean(self.vix_history[-5:])
+                vix_10d_avg = np.mean(self.vix_history[-10:])
+                vix_trend = (vix_5d_avg / vix_10d_avg) - 1.0  # Normalized trend
+            
+            # Adjust IV/HV threshold based on VIX volatility and trend
+            if recent_vix_std > 4.0:  # Extremely volatile VIX
+                # Be extremely selective in chaotic markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.5  # Increased from 1.4
+            elif recent_vix_std > 3.0:  # Very volatile VIX
+                # Be much more selective in unstable markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.4  # No change
+            elif recent_vix_std > 2.0:  # Moderately volatile VIX
+                # Be more selective in variable markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.3  # Increased from 1.25
+            elif recent_vix_std > 1.0:  # Slightly volatile VIX
+                # Be somewhat more selective in normal markets with some variability
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 1.15  # Increased from 1.1
+            elif recent_vix_std < 0.5 and current_vix < 15:  # Very stable low VIX
+                # Be slightly less selective in stable, low volatility markets
+                self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold * 0.95  # Slightly less reduction
             else:
+                # Standard markets
                 self.adaptive_iv_hv_ratio = self.iv_hv_ratio_threshold
+                
+            # Further adjust based on VIX trend (rising VIX = be more selective)
+            if vix_trend > 0.05:  # Strongly rising VIX
+                self.adaptive_iv_hv_ratio *= 1.1  # Additional 10% increase in selectivity
+            elif vix_trend < -0.05:  # Strongly falling VIX
+                # Don't reduce below original threshold
+                self.adaptive_iv_hv_ratio = max(self.iv_hv_ratio_threshold, self.adaptive_iv_hv_ratio * 0.95)
+        
+        self.logger.debug(f"Updated adaptive thresholds - IV: {self.adaptive_iv_threshold:.1f}%, "
+                        f"IV/HV ratio: {self.adaptive_iv_hv_ratio:.2f}, "
+                        f"VIX: {current_vix:.1f}, VIX percentile: {vix_percentile:.2f}")
     
     def analyze_volatility_for_harvesting(self, 
                                         symbol: str,
