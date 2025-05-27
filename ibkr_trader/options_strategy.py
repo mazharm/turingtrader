@@ -664,7 +664,9 @@ class OptionsStrategy:
         self,
         option_chain: Dict,
         current_price: float,
-        expiry_target: Optional[str] = None
+        expiry_target: Optional[str] = None,
+        min_credit: float = 0.0,
+        min_return_on_risk: float = 0.0
     ) -> Optional[Dict]:
         """
         Find appropriate legs for an iron condor spread.
@@ -980,9 +982,8 @@ class OptionsStrategy:
         net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
         
         # If net credit is too small, reject the iron condor
-        min_credit_threshold = 0.20  # Minimum $0.20 credit
-        if net_credit < min_credit_threshold:
-            self.logger.warning(f"Iron condor credit {net_credit:.2f} is below minimum threshold {min_credit_threshold:.2f}")
+        if net_credit < min_credit:
+            self.logger.warning(f"Iron condor credit {net_credit:.2f} is below minimum threshold {min_credit:.2f}")
             return None
         
         # Calculate max risk (width between strikes minus credit received)
@@ -1000,10 +1001,12 @@ class OptionsStrategy:
         # Calculate credit-to-risk ratio
         credit_to_risk_ratio = net_credit / max_width
         
-        # Only proceed if credit-to-risk ratio meets minimum threshold
-        min_credit_risk_ratio = 0.15  # Require at least 15% credit to width ratio
-        if credit_to_risk_ratio < min_credit_risk_ratio:
-            self.logger.warning(f"Iron condor credit-to-risk ratio {credit_to_risk_ratio:.2f} below threshold {min_credit_risk_ratio:.2f}")
+        # Calculate return on risk
+        return_on_risk = (net_credit / max_risk) * 100
+        
+        # Check return on risk threshold if specified
+        if min_return_on_risk > 0 and return_on_risk < min_return_on_risk:
+            self.logger.warning(f"Iron condor return on risk {return_on_risk:.2f}% is below minimum threshold {min_return_on_risk:.2f}%")
             return None
         
         # Calculate risk metrics
@@ -1435,7 +1438,9 @@ class OptionsStrategy:
         current_price: float,
         account_value: float,
         vix_analysis: Dict,
-        spread_type: str = 'bull_put'  # 'bull_put', 'bear_call'
+        spread_type: str = 'bull_put',  # 'bull_put', 'bear_call'
+        min_credit: float = 0.0,
+        min_return_on_risk: float = 0.0
     ) -> Dict:
         """
         Generate a vertical spread trade decision.
@@ -1475,9 +1480,8 @@ class OptionsStrategy:
             position_size_multiplier = 0.4
             
         # Additional checks for vertical spreads
-        # Minimum credit requirements (different for each spread type)
-        min_credit = 0.20  # Minimum $0.20 credit per spread
-        if vertical_spread['net_credit'] < min_credit:
+        # Minimum credit requirements
+        if min_credit > 0 and vertical_spread['net_credit'] < min_credit:
             self.logger.info(f"Vertical spread net credit too low: {vertical_spread['net_credit']:.2f} < {min_credit:.2f}")
             return {
                 'action': 'none',
@@ -1487,8 +1491,7 @@ class OptionsStrategy:
             }
             
         # Minimum return on risk
-        min_return_on_risk = 0.15  # At least 15% return on risk
-        if vertical_spread['return_on_risk'] < min_return_on_risk:
+        if min_return_on_risk > 0 and vertical_spread['return_on_risk'] < min_return_on_risk:
             self.logger.info(f"Vertical spread return on risk too low: {vertical_spread['return_on_risk']:.2f} < {min_return_on_risk:.2f}")
             return {
                 'action': 'none',

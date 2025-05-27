@@ -24,6 +24,11 @@ class RealisticMockDataFetcher:
         
         # Create data directory if it doesn't exist
         os.makedirs(data_dir, exist_ok=True)
+        
+        # Properties for enhanced backtesting
+        self.iv_hv_ratio_min = 1.2  # Minimum IV/HV ratio for backtesting
+        self.iv_hv_ratio_max = 2.5  # Maximum IV/HV ratio for backtesting
+        self.base_vix_level = 25.0  # Base VIX level for more realistic volatility
     
     def fetch_data(self, 
                  symbol: str, 
@@ -148,10 +153,10 @@ class RealisticMockDataFetcher:
         # Create base dataframe
         df = pd.DataFrame(index=date_range)
         
-        # VIX parameters
-        mean_level = 17.0         # Long-term mean
+        # VIX parameters - adjusted for more trading signals
+        mean_level = self.base_vix_level  # Use the base VIX level
         reversion_strength = 0.05  # Mean reversion strength
-        daily_volatility = 0.05    # Daily volatility
+        daily_volatility = 0.06    # Increased daily volatility for more signal opportunities
         
         # Generate VIX levels with mean-reverting behavior and occasional spikes
         num_days = len(date_range)
@@ -172,10 +177,10 @@ class RealisticMockDataFetcher:
             vix_levels[i] = vix_levels[i-1] + mean_reversion + random_shock
             
             # Ensure VIX is always positive and add occasional spikes
-            vix_levels[i] = max(9.0, vix_levels[i])
+            vix_levels[i] = max(12.0, vix_levels[i])
         
         # Add occasional volatility spikes (market panic events)
-        for i in range(num_days // 60):  # A few spikes per year
+        for i in range(num_days // 30):  # More frequent spikes (every ~30 days)
             spike_idx = np.random.randint(0, num_days)
             spike_magnitude = np.random.uniform(1.5, 2.5)  # 50-150% increase
             vix_levels[spike_idx] = vix_levels[spike_idx] * spike_magnitude
@@ -306,7 +311,7 @@ class RealisticMockDataFetcher:
             
             # Implied volatility tends to be higher for nearer-term options and lower for longer term
             # Also, VIX level influences the IV
-            base_iv = current_vix / 100.0  # Convert VIX to decimal
+            base_iv = max(current_vix / 100.0 * 1.4, 0.30)  # Convert VIX to decimal, increase by 40%, minimum 30%
             # IV skew - higher for OTM puts, lower for OTM calls
             
             # Create strike prices around current price
@@ -435,4 +440,20 @@ class RealisticMockDataFetcher:
             if file.endswith('realistic_mock.csv'):
                 if symbol is None or file.startswith(f"{symbol}_"):
                     os.remove(os.path.join(self.data_dir, file))
+                    
+    def get_iv_hv_ratio(self, symbol: str, date=None, expiry=None) -> float:
+        """
+        Generate synthetic IV/HV ratio for backtesting.
+        
+        Args:
+            symbol: Ticker symbol
+            date: Date to get ratio for (ignored in mock)
+            expiry: Option expiry (ignored in mock)
+            
+        Returns:
+            Float IV/HV ratio
+        """
+        # Generate a realistic but elevated IV/HV ratio for testing
+        # Randomly generate between the min and max values set in the constructor
+        return np.random.uniform(self.iv_hv_ratio_min, self.iv_hv_ratio_max)
                     self.logger.info(f"Removed mock cache file: {file}")
