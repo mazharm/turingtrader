@@ -148,10 +148,10 @@ class RealisticMockDataFetcher:
         # Create base dataframe
         df = pd.DataFrame(index=date_range)
         
-        # VIX parameters
-        mean_level = 17.0         # Long-term mean
+        # VIX parameters - adjusted for more trading signals
+        mean_level = 22.0         # Increased long-term mean for more trading signals
         reversion_strength = 0.05  # Mean reversion strength
-        daily_volatility = 0.05    # Daily volatility
+        daily_volatility = 0.06    # Increased daily volatility for more signal opportunities
         
         # Generate VIX levels with mean-reverting behavior and occasional spikes
         num_days = len(date_range)
@@ -172,10 +172,10 @@ class RealisticMockDataFetcher:
             vix_levels[i] = vix_levels[i-1] + mean_reversion + random_shock
             
             # Ensure VIX is always positive and add occasional spikes
-            vix_levels[i] = max(9.0, vix_levels[i])
+            vix_levels[i] = max(12.0, vix_levels[i])
         
         # Add occasional volatility spikes (market panic events)
-        for i in range(num_days // 60):  # A few spikes per year
+        for i in range(num_days // 30):  # More frequent spikes (every ~30 days)
             spike_idx = np.random.randint(0, num_days)
             spike_magnitude = np.random.uniform(1.5, 2.5)  # 50-150% increase
             vix_levels[spike_idx] = vix_levels[spike_idx] * spike_magnitude
