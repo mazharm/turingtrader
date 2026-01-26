@@ -249,8 +249,9 @@ class RealisticMockDataFetcher:
             else:
                 # Fallback prices if no data
                 underlying_price = 450.0 if symbol.upper() in ['SPY', '^SPX', 'SPX'] else 100.0
-        except:
+        except (KeyError, IndexError, ValueError) as e:
             # Fallback prices if error
+            self.logger.warning(f"Error fetching price data for {symbol}: {e}")
             underlying_price = 450.0 if symbol.upper() in ['SPY', '^SPX', 'SPX'] else 100.0
             
         # For VIX, get current level to inform implied volatility
@@ -260,7 +261,8 @@ class RealisticMockDataFetcher:
                 current_vix = vix_data['close'].iloc[-1]
             else:
                 current_vix = 15.0
-        except:
+        except (KeyError, IndexError, ValueError) as e:
+            self.logger.warning(f"Error fetching VIX data: {e}")
             current_vix = 15.0
             
         # Create realistic expiration dates (weekly for SPY)
@@ -456,4 +458,3 @@ class RealisticMockDataFetcher:
         # Generate a realistic but elevated IV/HV ratio for testing
         # Randomly generate between the min and max values set in the constructor
         return np.random.uniform(self.iv_hv_ratio_min, self.iv_hv_ratio_max)
-                    self.logger.info(f"Removed mock cache file: {file}")

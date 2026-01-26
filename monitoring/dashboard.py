@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import threading
 import json
 import time
+import random
 
 try:
     import dash
@@ -28,22 +29,39 @@ except ImportError as e:
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ibkr_trader.config import Config
 
+# Import monitoring modules
+try:
+    from monitoring.metrics_store import MetricsStore
+    from monitoring.alert_manager import AlertManager, Alert, AlertSeverity
+    HAS_MONITORING = True
+except ImportError:
+    HAS_MONITORING = False
+
 
 class Dashboard:
     """
     Dashboard for monitoring the TuringTrader algorithmic trading system.
     """
     
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        enable_persistence: bool = False,
+        enable_alerts: bool = False
+    ):
         """
         Initialize the dashboard.
-        
+
         Args:
             config: Configuration object
+            enable_persistence: Enable metrics persistence to database
+            enable_alerts: Enable alert monitoring and display
         """
         self.logger = logging.getLogger(__name__)
         self.config = config or Config()
-        
+        self.enable_persistence = enable_persistence and HAS_MONITORING
+        self.enable_alerts = enable_alerts and HAS_MONITORING
+
         # Initialize data storage
         self.trade_history = []
         self.position_data = {}
@@ -55,20 +73,46 @@ class Dashboard:
             'uptime': 0,
             'trading_enabled': False,
         }
-        
+
+        # Initialize persistence layer
+        self.metrics_store: Optional[MetricsStore] = None
+        self.alert_manager: Optional[AlertManager] = None
+
+        if self.enable_persistence:
+            try:
+                self.metrics_store = MetricsStore(
+                    postgres_config=self.config.postgres,
+                    auto_connect=True
+                )
+                self.logger.info("Metrics persistence enabled")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize metrics store: {e}")
+                self.metrics_store = None
+
+        if self.enable_alerts:
+            try:
+                self.alert_manager = AlertManager(
+                    postgres_config=self.config.postgres,
+                    auto_connect=True
+                )
+                self.logger.info("Alert monitoring enabled")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize alert manager: {e}")
+                self.alert_manager = None
+
         # Create the Dash app
         self.app = dash.Dash(
             __name__,
             external_stylesheets=[dbc.themes.DARKLY],
             suppress_callback_exceptions=True
         )
-        
+
         # Initialize the layout
         self._setup_layout()
-        
+
         # Set up callbacks
         self._setup_callbacks()
-        
+
         # Start update thread for simulated data (for development)
         self.update_thread = None
         self.running = False
@@ -160,7 +204,7 @@ class Dashboard:
                         ])
                     ], className="mb-4")
                 ], width=6),
-                
+
                 # Trades by strategy
                 dbc.Col([
                     dbc.Card([
@@ -171,7 +215,33 @@ class Dashboard:
                     ], className="mb-4")
                 ], width=6),
             ]),
-            
+
+            # Risk Metrics section
+            dbc.Row([
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader(html.H3("Risk Metrics")),
+                        dbc.CardBody([
+                            html.Div(id="risk-metrics-display")
+                        ])
+                    ], className="mb-4")
+                ], width=6),
+
+                # Active Alerts section
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader([
+                            html.H3("Active Alerts", className="d-inline"),
+                            dbc.Badge(id="alert-count-badge", color="danger",
+                                     className="ms-2")
+                        ]),
+                        dbc.CardBody([
+                            html.Div(id="active-alerts-display")
+                        ])
+                    ], className="mb-4")
+                ], width=6),
+            ]),
+
             # Store for storing intermediate data
             dcc.Store(id='data-store'),
             
@@ -253,7 +323,8 @@ class Dashboard:
                     update_text = f"Last update: {time_diff.seconds // 60} minutes ago"
                 else:
                     update_text = f"Last update: {update_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            except:
+            except (KeyError, ValueError, TypeError) as e:
+                self.logger.debug(f"Error formatting update time: {e}")
                 update_text = f"Last update: {last_update}"
                 
             return (
@@ -366,7 +437,8 @@ class Dashboard:
                 try:
                     entry_time = datetime.fromisoformat(pos.get('entry_time'))
                     days_held = (datetime.now() - entry_time).days
-                except:
+                except (KeyError, ValueError, TypeError) as e:
+                    self.logger.debug(f"Error calculating days held: {e}")
                     days_held = 0
                     
                 # Format P&L
@@ -630,13 +702,112 @@ class Dashboard:
                 )
                 
                 return fig
-                
+
             except Exception as e:
                 self.logger.error(f"Error creating strategy graph: {e}")
                 return go.Figure().update_layout(
                     title=f"Error creating strategy graph: {str(e)}",
                     template="plotly_dark"
                 )
+
+        # Callback to update risk metrics display
+        @self.app.callback(
+            Output('risk-metrics-display', 'children'),
+            [Input('data-store', 'data')]
+        )
+        def update_risk_metrics(data):
+            """Update the risk metrics display."""
+            if not data or 'metrics' not in data or not data['metrics']:
+                return html.P("No risk metrics available")
+
+            metrics = data['metrics']
+
+            # Extract risk-specific metrics
+            risk_metrics = [
+                ('Current Drawdown', metrics.get('current_drawdown', 0), '%', 'warning'),
+                ('Max Drawdown', metrics.get('max_drawdown', 0), '%', 'danger'),
+                ('VaR (95%)', metrics.get('var_95', 0), '$', 'info'),
+                ('Margin Utilization', metrics.get('margin_utilization', 0), '%',
+                 'danger' if metrics.get('margin_utilization', 0) > 70 else 'info'),
+                ('Delta Exposure', metrics.get('delta_exposure', 0), '', 'info'),
+                ('Position Count', metrics.get('position_count', 0), '', 'primary'),
+            ]
+
+            return dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H6(name, className="mb-1"),
+                        html.H4(
+                            f"{value:.2f}{unit}" if isinstance(value, float) else f"{value}{unit}",
+                            className=f"text-{color}"
+                        )
+                    ], className="metric-item")
+                ], width=4)
+                for name, value, unit, color in risk_metrics
+            ])
+
+        # Callback to update alerts display
+        @self.app.callback(
+            [Output('active-alerts-display', 'children'),
+             Output('alert-count-badge', 'children')],
+            [Input('data-store', 'data')]
+        )
+        def update_alerts_display(data):
+            """Update the active alerts display."""
+            alerts = []
+
+            # Get alerts from data store or alert manager
+            if data and 'alerts' in data:
+                alerts = data['alerts']
+            elif self.alert_manager:
+                try:
+                    alert_objects = self.alert_manager.get_active_alerts()
+                    alerts = [
+                        {
+                            'id': a.id,
+                            'type': a.alert_type,
+                            'severity': a.severity,
+                            'message': a.message,
+                            'time': a.created_at.isoformat() if a.created_at else ''
+                        }
+                        for a in alert_objects[:10]  # Limit to 10 most recent
+                    ]
+                except Exception as e:
+                    self.logger.error(f"Error fetching alerts: {e}")
+
+            if not alerts:
+                return html.P("No active alerts", className="text-success"), "0"
+
+            # Map severity to Bootstrap color
+            severity_colors = {
+                'critical': 'danger',
+                'warning': 'warning',
+                'info': 'info'
+            }
+
+            alert_items = []
+            for alert in alerts:
+                severity = alert.get('severity', 'info')
+                color = severity_colors.get(severity, 'secondary')
+
+                alert_items.append(
+                    dbc.Alert([
+                        html.Div([
+                            dbc.Badge(
+                                alert.get('type', 'Unknown').upper(),
+                                color=color,
+                                className="me-2"
+                            ),
+                            html.Strong(alert.get('message', 'No message')),
+                        ]),
+                        html.Small(
+                            alert.get('time', '')[:19] if alert.get('time') else '',
+                            className="text-muted"
+                        )
+                    ], color=color, className="mb-2")
+                )
+
+            return html.Div(alert_items), str(len(alerts))
     
     def update_positions(self, positions: Dict[str, Dict]) -> None:
         """
@@ -661,12 +832,38 @@ class Dashboard:
     def update_metrics(self, metrics: Dict) -> None:
         """
         Update performance metrics.
-        
+
         Args:
             metrics: Dictionary with performance metrics
         """
         self.performance_metrics = metrics
         self.system_status['last_update'] = datetime.now().isoformat()
+
+        # Persist metrics if enabled
+        if self.metrics_store and self.enable_persistence:
+            try:
+                # Store individual metrics
+                metrics_to_store = {
+                    k: v for k, v in metrics.items()
+                    if isinstance(v, (int, float)) and k != 'volatility_history'
+                }
+                self.metrics_store.store_batch(metrics_to_store)
+            except Exception as e:
+                self.logger.error(f"Error persisting metrics: {e}")
+
+        # Check alert thresholds if enabled
+        if self.alert_manager and self.enable_alerts:
+            try:
+                # Map metrics to alert threshold names
+                alert_metrics = {
+                    'current_drawdown': metrics.get('max_drawdown', 0),
+                    'daily_loss_pct': abs(min(0, metrics.get('daily_pnl', 0) /
+                                           max(1, metrics.get('account_value', 100000)) * 100)),
+                    'margin_utilization': metrics.get('margin_utilization', 0),
+                }
+                self.alert_manager.check_thresholds(alert_metrics)
+            except Exception as e:
+                self.logger.error(f"Error checking alert thresholds: {e}")
     
     def update_status(self, status: str, message: str, trading_enabled: bool = True) -> None:
         """
@@ -803,7 +1000,7 @@ class Dashboard:
     def run(self, debug: bool = False, port: int = 8050, host: str = '0.0.0.0', use_sample_data: bool = False) -> None:
         """
         Run the dashboard.
-        
+
         Args:
             debug: Whether to run in debug mode
             port: Port number
@@ -812,13 +1009,13 @@ class Dashboard:
         """
         if use_sample_data:
             self.start_sample_data_generator()
-            
+
         try:
             # Add custom CSS
             app_directory = os.path.dirname(os.path.abspath(__file__))
             assets_directory = os.path.join(app_directory, 'assets')
             os.makedirs(assets_directory, exist_ok=True)
-            
+
             with open(os.path.join(assets_directory, 'custom.css'), 'w') as f:
                 f.write("""
                 .status-indicator {
@@ -846,19 +1043,58 @@ class Dashboard:
                     border-radius: 5px;
                     background-color: rgba(0, 0, 0, 0.1);
                 }
+                .alert-item {
+                    margin-bottom: 5px;
+                }
                 """)
-            
+
             self.app.run_server(debug=debug, port=port, host=host)
         finally:
             if use_sample_data:
                 self.stop_sample_data_generator()
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        """Clean up resources."""
+        if self.metrics_store:
+            try:
+                self.metrics_store.close()
+            except Exception as e:
+                self.logger.error(f"Error closing metrics store: {e}")
+
+        if self.alert_manager:
+            try:
+                self.alert_manager.close()
+            except Exception as e:
+                self.logger.error(f"Error closing alert manager: {e}")
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TuringTrader Monitoring Dashboard")
+    parser.add_argument("--debug", action="store_true", help="Run in debug mode")
+    parser.add_argument("--port", type=int, default=8050, help="Port number")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--sample-data", action="store_true", help="Generate sample data")
+    parser.add_argument("--persistence", action="store_true", help="Enable metrics persistence")
+    parser.add_argument("--alerts", action="store_true", help="Enable alert monitoring")
+    args = parser.parse_args()
+
     # Setup logging
-    logging.basicConfig(level=logging.INFO, 
-                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
     # Create and run dashboard
-    dashboard = Dashboard()
-    dashboard.run(debug=True, use_sample_data=True)
+    dashboard = Dashboard(
+        enable_persistence=args.persistence,
+        enable_alerts=args.alerts
+    )
+    dashboard.run(
+        debug=args.debug,
+        port=args.port,
+        host=args.host,
+        use_sample_data=args.sample_data
+    )

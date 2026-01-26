@@ -65,6 +65,104 @@ class RedisConfig:
         return conn_str
 
 
+def _create_monitoring_tables(cursor, has_timescale: bool) -> None:
+    """
+    Create monitoring-related tables for metrics, risk tracking, and alerts.
+
+    Args:
+        cursor: Database cursor
+        has_timescale: Whether TimescaleDB is available
+    """
+    # Performance metrics time series
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS performance_metrics (
+            time TIMESTAMPTZ NOT NULL,
+            metric_name VARCHAR(64) NOT NULL,
+            metric_value DOUBLE PRECISION,
+            risk_level INT,
+            metadata JSONB
+        );
+    """)
+
+    # Risk metrics
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS risk_metrics (
+            time TIMESTAMPTZ NOT NULL,
+            var_95 DOUBLE PRECISION,
+            var_99 DOUBLE PRECISION,
+            current_drawdown DOUBLE PRECISION,
+            max_drawdown DOUBLE PRECISION,
+            margin_utilization DOUBLE PRECISION,
+            delta_exposure DOUBLE PRECISION,
+            position_count INT,
+            risk_level INT
+        );
+    """)
+
+    # Alerts
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            alert_type VARCHAR(32) NOT NULL,
+            severity VARCHAR(16) NOT NULL,
+            message TEXT NOT NULL,
+            metric_name VARCHAR(64),
+            metric_value DOUBLE PRECISION,
+            threshold_value DOUBLE PRECISION,
+            acknowledged BOOLEAN DEFAULT FALSE,
+            acknowledged_at TIMESTAMPTZ,
+            acknowledged_by VARCHAR(64),
+            resolved BOOLEAN DEFAULT FALSE,
+            resolved_at TIMESTAMPTZ
+        );
+    """)
+
+    # Daily performance summary
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_performance (
+            date DATE NOT NULL PRIMARY KEY,
+            starting_balance DOUBLE PRECISION,
+            ending_balance DOUBLE PRECISION,
+            daily_pnl DOUBLE PRECISION,
+            daily_return_pct DOUBLE PRECISION,
+            trades_count INT,
+            winning_trades INT,
+            losing_trades INT,
+            max_drawdown_pct DOUBLE PRECISION,
+            risk_level INT
+        );
+    """)
+
+    # Convert monitoring tables to hypertables if TimescaleDB is available
+    if has_timescale:
+        try:
+            cursor.execute("""
+                SELECT create_hypertable('performance_metrics', 'time', if_not_exists => TRUE);
+            """)
+            cursor.execute("""
+                SELECT create_hypertable('risk_metrics', 'time', if_not_exists => TRUE);
+            """)
+        except Exception as e:
+            print(f"Warning: Could not convert monitoring tables to hypertables: {e}")
+
+    # Create indexes for monitoring tables
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_performance_metrics_time
+            ON performance_metrics (time DESC);
+        CREATE INDEX IF NOT EXISTS idx_performance_metrics_name
+            ON performance_metrics (metric_name, time DESC);
+        CREATE INDEX IF NOT EXISTS idx_risk_metrics_time
+            ON risk_metrics (time DESC);
+        CREATE INDEX IF NOT EXISTS idx_alerts_created
+            ON alerts (created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_alerts_type_severity
+            ON alerts (alert_type, severity);
+        CREATE INDEX IF NOT EXISTS idx_alerts_unacknowledged
+            ON alerts (acknowledged) WHERE acknowledged = FALSE;
+    """)
+
+
 def create_postgres_tables(conn_string: str) -> bool:
     """
     Create required PostgreSQL tables if they don't exist.
@@ -152,11 +250,14 @@ def create_postgres_tables(conn_string: str) -> bool:
             CREATE INDEX IF NOT EXISTS idx_market_data_symbol ON market_data (symbol, time DESC);
             CREATE INDEX IF NOT EXISTS idx_options_data_symbol ON options_data (symbol, expiry, strike);
         """)
-        
+
+        # Create monitoring tables
+        _create_monitoring_tables(cursor, has_timescale)
+
         conn.commit()
         cursor.close()
         conn.close()
-        
+
         return True
         
     except Exception as e:
