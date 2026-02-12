@@ -868,9 +868,17 @@ class VolatilityAnalyzer:
                 hv = self.market_data_store.calculate_historical_volatility(symbol)
             elif len(self.historical_volatility) > 0:
                 hv = self.historical_volatility[-1]
-            
+
+            # If no HV available, estimate from VIX history
+            if hv == 0.0 and len(self.vix_history) >= 5:
+                hv = np.std(self.vix_history[-20:]) * np.sqrt(252) if len(self.vix_history) >= 20 else np.std(self.vix_history) * np.sqrt(252)
+                if hv == 0.0:
+                    hv = current_vix * 0.8  # Estimate HV as 80% of current VIX
+            elif hv == 0.0:
+                hv = current_vix * 0.8  # Fallback estimate
+
             result['historical_volatility'] = hv
-            
+
             # Calculate implied volatility
             iv = 0.0
             if option_chain:
@@ -883,10 +891,14 @@ class VolatilityAnalyzer:
                     for put in expiry_data.get('puts', {}).values():
                         if put.get('iv', 0) > 0:
                             all_ivs.append(put['iv'])
-                
+
                 if all_ivs:
                     iv = np.mean(all_ivs) * 100  # Convert to percentage
-            
+
+            # If no IV from chain, use VIX as proxy
+            if iv == 0.0:
+                iv = current_vix
+
             result['implied_volatility'] = iv
             
             # Calculate IV/HV ratio

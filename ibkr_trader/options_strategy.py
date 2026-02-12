@@ -508,6 +508,10 @@ class OptionsStrategy:
                 # In flat high volatility, slight bias to put side as markets often recover
                 spread_type = "bull_put"
                 self.logger.info(f"High volatility with flat VIX and high IV/HV - selecting bull put spreads")
+            elif iv_hv_ratio > 1.1:
+                # Moderate IV/HV in high vol with flat trend - iron condors with wider wings
+                strategy = "iron_condor"
+                self.logger.info(f"High volatility with moderate IV/HV ({iv_hv_ratio:.2f}) - selecting iron condors")
             else:
                 # Not enough edge in high volatility without clear direction or premium
                 strategy = None
@@ -533,6 +537,10 @@ class OptionsStrategy:
                 strategy = "vertical_spread"
                 spread_type = "bull_put"  # Bullish bias when volatility is falling
                 self.logger.info(f"Normal volatility with falling VIX - selecting bull put spreads")
+            elif iv_hv_ratio > 1.1:
+                # Moderate IV/HV ratio with flat trend - still good for iron condors
+                strategy = "iron_condor"
+                self.logger.info(f"Normal volatility with moderate IV/HV ratio ({iv_hv_ratio:.2f}) - selecting iron condors")
             else:
                 # Not enough premium edge
                 strategy = None
@@ -574,20 +582,20 @@ class OptionsStrategy:
             
             # Verify the trade meets our minimum requirements
             if trade_decision['action'] != 'none':
-                # Evaluate the trade quality
+                # Evaluate the trade quality (use per-contract dollar values for consistency)
                 trade_data = {
-                    'net_credit': trade_decision.get('net_credit', 0),
-                    'max_loss': trade_decision.get('max_loss', float('inf')),
+                    'net_credit': trade_decision.get('net_credit', 0) * 100,  # per-contract dollars
+                    'max_loss': trade_decision.get('max_risk_per_spread', trade_decision.get('max_loss', float('inf'))),  # per-contract dollars
                     'prob_profit': trade_decision.get('prob_profit', 0),
                     'days_to_expiry': trade_decision.get('days_to_expiry', 30),
                     'width': trade_decision.get('width', 0),
                     'iv': vol_harvest_analysis.get('implied_volatility', 0),
                     'iv_hv_ratio': iv_hv_ratio
                 }
-                
+
                 trade_score = self._evaluate_trade(trade_data)
                 trade_decision['trade_score'] = trade_score
-                
+
                 # Only execute trades with a minimum score
                 if trade_score < 60:
                     self.logger.info(f"Iron condor trade score too low ({trade_score:.1f}) - no trade")
@@ -599,19 +607,19 @@ class OptionsStrategy:
                 self.last_trade_time = datetime.now()
                 self.todays_trades.append(trade_decision)
             return trade_decision
-            
+
         elif strategy == "vertical_spread" and spread_type is not None:
             trade_decision = self.generate_vertical_spread_trade(
                 option_chain, current_price, account_value, vix_analysis, spread_type,
                 min_credit=min_credit_threshold, min_return_on_risk=min_return_on_risk
             )
-            
+
             # Verify the trade meets our minimum requirements
             if trade_decision['action'] != 'none':
-                # Evaluate the trade quality
+                # Evaluate the trade quality (use per-contract dollar values for consistency)
                 trade_data = {
-                    'net_credit': trade_decision.get('net_credit', 0),
-                    'max_loss': trade_decision.get('max_loss', float('inf')),
+                    'net_credit': trade_decision.get('net_credit', 0) * 100,  # per-contract dollars
+                    'max_loss': trade_decision.get('max_risk_per_spread', trade_decision.get('max_loss', float('inf'))),  # per-contract dollars
                     'prob_profit': trade_decision.get('prob_profit', 0),
                     'days_to_expiry': trade_decision.get('days_to_expiry', 30),
                     'width': trade_decision.get('width', 0),
@@ -770,20 +778,19 @@ class OptionsStrategy:
                 spread_pct = (ask - bid) / bid if bid > 0 else float('inf')
                 
                 # Only consider strikes with reasonable delta, liquidity and bid price
-                if (delta <= self.target_short_delta and 
-                    delta >= self.target_short_delta * 0.7 and  # Ensure delta is not too small
-                    bid >= 0.15 and 
-                    volume >= 10 and 
-                    open_interest >= 50 and
-                    spread_pct < 0.15):
-                    
+                if (delta <= self.target_short_delta * 1.3 and
+                    delta >= self.target_short_delta * 0.5 and
+                    bid >= 0.10 and
+                    volume >= 5 and
+                    spread_pct < 0.20):
+
                     # Calculate a score based on how close delta is to target, premium, and liquidity
                     delta_score = 1.0 - abs(delta - self.target_short_delta) / self.target_short_delta
-                    premium_score = min(1.0, bid / 3.0)  # Scale to max 1.0 at premium of $3.00
-                    liquidity_score = min(1.0, volume / 500) * 0.5 + min(1.0, open_interest / 1000) * 0.5
-                    
+                    premium_score = min(1.0, bid / 3.0)
+                    liquidity_score = min(1.0, volume / 500) * 0.5 + min(1.0, (open_interest or 0) / 1000) * 0.5
+
                     score = delta_score * 0.5 + premium_score * 0.3 + liquidity_score * 0.2
-                    
+
                     short_call_candidates.append({
                         'strike': strike,
                         'delta': delta,
@@ -792,30 +799,29 @@ class OptionsStrategy:
                         'option': call,
                         'score': score
                     })
-        
+
         # Find short put (OTM put with delta closest to target) with good liquidity
         short_put_candidates = []
-        
+
         for i in range(atm_index, -1, -1):
             strike = strikes[i]
             if strike < current_price and strike in puts:  # OTM put
                 put = puts[strike]
-                delta = put.get('delta', abs(1 - (strike / current_price)))
+                delta = abs(put.get('delta', -(1 - (strike / current_price))))  # Use abs() since put delta is stored as negative
                 bid = put.get('bid', 0)
                 ask = put.get('ask', 0)
                 volume = put.get('volume', 0) if put.get('volume') is not None else 0
                 open_interest = put.get('open_interest', 0) if put.get('open_interest') is not None else 0
-                
+
                 # Calculate bid-ask spread percentage
                 spread_pct = (ask - bid) / bid if bid > 0 else float('inf')
-                
+
                 # Only consider strikes with reasonable delta, liquidity and bid price
-                if (delta <= self.target_short_delta and 
-                    delta >= self.target_short_delta * 0.7 and  # Ensure delta is not too small
-                    bid >= 0.15 and 
-                    volume >= 10 and 
-                    open_interest >= 50 and
-                    spread_pct < 0.15):
+                if (delta <= self.target_short_delta * 1.3 and
+                    delta >= self.target_short_delta * 0.5 and
+                    bid >= 0.10 and
+                    volume >= 5 and
+                    spread_pct < 0.20):
                     
                     # Calculate a score based on how close delta is to target, premium, and liquidity
                     delta_score = 1.0 - abs(delta - self.target_short_delta) / self.target_short_delta
@@ -1279,16 +1285,16 @@ class OptionsStrategy:
                 'max_risk': max_risk * 100,  # Per contract (multiply by 100)
                 'max_profit': net_credit * 100,  # Per contract
                 'credit_to_width_ratio': net_credit / width if width > 0 else 0,
-                'return_on_risk': net_credit / max_risk if max_risk > 0 else 0,
+                'return_on_risk': (net_credit / max_risk) * 100 if max_risk > 0 else 0,
                 'prob_profit': prob_profit
             }
-            
+
             self.logger.info(f"Found {spread_type} spread: {target_expiry} expiry, "
                            f"short {option_type} @ {short_strike}, long {option_type} @ {long_strike}, "
                            f"width: {width}, credit: {net_credit:.2f}, max risk: {max_risk * 100:.2f}")
-            
+
             return spread
-            
+
         elif spread_type == 'bear_call':  # Sell lower call, buy higher call (credit spread)
             # For bear call spread, we want to find strikes above the current price
             # that have reasonable premium and liquidity
@@ -1415,16 +1421,16 @@ class OptionsStrategy:
                 'max_risk': max_risk * 100,  # Per contract (multiply by 100)
                 'max_profit': net_credit * 100,  # Per contract
                 'credit_to_width_ratio': net_credit / width if width > 0 else 0,
-                'return_on_risk': net_credit / max_risk if max_risk > 0 else 0,
+                'return_on_risk': (net_credit / max_risk) * 100 if max_risk > 0 else 0,
                 'prob_profit': prob_profit
             }
-            
+
             self.logger.info(f"Found {spread_type} spread: {target_expiry} expiry, "
                            f"short {option_type} @ {short_strike}, long {option_type} @ {long_strike}, "
                            f"width: {width}, credit: {net_credit:.2f}, max risk: {max_risk * 100:.2f}")
-            
+
             return spread
-        
+
         # TODO: Add logic for debit spreads (bull_call and bear_put) if needed
         
         return None
@@ -1521,12 +1527,12 @@ class OptionsStrategy:
         quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 1
         quantity = max(1, quantity)  # At least 1 contract
         
-        # Additional cap based on account size
-        max_quantity_by_account = int(account_value * 0.005 / max_risk_per_spread)
+        # Cap quantity based on account size (risk no more than 5% per trade)
+        max_quantity_by_account = max(1, int(account_value * 0.05 / max_risk_per_spread))
         quantity = min(quantity, max_quantity_by_account)
-        
+
         # Absolute maximum contracts
-        absolute_max_contracts = 10
+        absolute_max_contracts = 20
         quantity = min(quantity, absolute_max_contracts)
         
         # Calculate total credit and max loss
@@ -1689,12 +1695,12 @@ class OptionsStrategy:
         quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 1
         quantity = max(1, quantity)  # At least 1 contract
         
-        # Additional cap on quantity based on account size - reduced from 0.005 to 0.004
-        max_quantity_by_account = int(account_value * 0.004 / max_risk_per_spread)
+        # Cap quantity based on account size (risk no more than 5% of account per trade)
+        max_quantity_by_account = max(1, int(account_value * 0.05 / max_risk_per_spread))
         quantity = min(quantity, max_quantity_by_account)
-        
+
         # Absolute maximum contracts for risk control
-        absolute_max_contracts = 8  # Reduced from default
+        absolute_max_contracts = 20
         quantity = min(quantity, absolute_max_contracts)
         
         # Calculate total credit and max loss
@@ -1713,6 +1719,7 @@ class OptionsStrategy:
             'quantity': quantity,
             'net_credit': iron_condor['net_credit'],
             'total_credit': total_credit,
+            'width': iron_condor['long_call_strike'] - iron_condor['short_call_strike'],
             'max_risk_per_spread': max_risk_per_spread,
             'max_loss': max_loss,
             'return_on_risk': iron_condor['return_on_risk'],

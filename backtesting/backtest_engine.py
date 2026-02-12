@@ -382,13 +382,14 @@ class BacktestEngine:
         long_put = trade_decision.get('long_put_strike', 0)
         max_risk = trade_decision.get('max_risk_per_spread', trade_decision.get('max_risk', 0))
 
-        # Margin required is the max risk per spread
-        margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+        # Margin required is the max risk per spread (already in per-contract dollars)
+        margin_required = max_risk * quantity if max_risk > 0 else net_credit * 3 * quantity * 100
 
         if margin_required > self.current_balance * 0.5:
             # Reduce quantity to fit within 50% of balance
-            quantity = max(1, int(self.current_balance * 0.5 / (margin_required / quantity)))
-            margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+            per_contract_margin = max_risk if max_risk > 0 else net_credit * 3 * 100
+            quantity = max(1, int(self.current_balance * 0.5 / per_contract_margin))
+            margin_required = max_risk * quantity if max_risk > 0 else net_credit * 3 * quantity * 100
 
         if quantity <= 0 or margin_required > self.current_balance:
             return
@@ -441,12 +442,13 @@ class BacktestEngine:
         long_strike = trade_decision.get('long_strike', 0)
         max_risk = trade_decision.get('max_risk_per_spread', trade_decision.get('max_risk', 0))
 
-        # Margin required is the max risk per spread
-        margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+        # Margin required is the max risk per spread (already in per-contract dollars)
+        margin_required = max_risk * quantity if max_risk > 0 else net_credit * 3 * quantity * 100
 
         if margin_required > self.current_balance * 0.5:
-            quantity = max(1, int(self.current_balance * 0.5 / (margin_required / quantity)))
-            margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+            per_contract_margin = max_risk if max_risk > 0 else net_credit * 3 * 100
+            quantity = max(1, int(self.current_balance * 0.5 / per_contract_margin))
+            margin_required = max_risk * quantity if max_risk > 0 else net_credit * 3 * quantity * 100
 
         if quantity <= 0 or margin_required > self.current_balance:
             return
@@ -587,33 +589,46 @@ class BacktestEngine:
             puts = {}
             
             for strike in strikes:
-                # Calculate options prices using a simple model
-                
-                # Moneyness factor (higher IV for OTM options - volatility smile)
-                moneyness = abs((strike / current_price) - 1.0)
-                smile_factor = 1.0 + moneyness * 2.0
-                
-                # Adjusted IV for this specific option
+                # Black-Scholes-style option pricing approximation
+                abs_moneyness = abs((strike / current_price) - 1.0)
+
+                # Volatility smile (mild skew)
+                smile_factor = 1.0 + abs_moneyness * 0.3
                 adjusted_iv = base_iv * expiry_iv_factor * smile_factor
-                
-                # Calculate rough option prices using Black-Scholes approximation
-                intrinsic_call = max(0, current_price - strike)
-                intrinsic_put = max(0, strike - current_price)
-                
-                time_value = current_price * adjusted_iv * math.sqrt(t)
-                
-                call_price = round(intrinsic_call + time_value * 0.5, 2)
-                put_price = round(intrinsic_put + time_value * 0.5, 2)
-                
-                # Add some bid-ask spread
-                call_bid = max(0.01, round(call_price * 0.95, 2))
-                call_ask = round(call_price * 1.05, 2)
-                put_bid = max(0.01, round(put_price * 0.95, 2))
-                put_ask = round(put_price * 1.05, 2)
-                
-                # Calculate rough delta
-                call_delta = max(0.01, min(0.99, 0.5 + 0.5 * ((current_price / strike) - 1) / (adjusted_iv * math.sqrt(t))))
-                put_delta = max(0.01, min(0.99, 0.5 - 0.5 * ((current_price / strike) - 1) / (adjusted_iv * math.sqrt(t))))
+
+                vol_t = adjusted_iv * math.sqrt(t) if t > 0 else 0.01
+
+                # d1 approximation for Black-Scholes
+                d1 = math.log(current_price / strike) / vol_t + 0.5 * vol_t
+
+                # Standard normal CDF approximation (Abramowitz & Stegun)
+                def norm_cdf(x):
+                    a = 0.4361836
+                    b = -0.1201676
+                    c = 0.9372980
+                    k = 1.0 / (1.0 + 0.33267 * abs(x))
+                    cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * (a * k + b * k * k + c * k * k * k)
+                    return cdf if x >= 0 else 1.0 - cdf
+
+                d2 = d1 - vol_t
+
+                nd1 = norm_cdf(d1)
+                nd2 = norm_cdf(d2)
+
+                # Option prices (no risk-free rate for simplicity)
+                call_price = max(0.01, round(current_price * nd1 - strike * nd2, 2))
+                put_price = max(0.01, round(call_price - current_price + strike, 2))  # Put-call parity
+
+                # Bid-ask spread (wider for far OTM)
+                spread_half = 0.04 + abs_moneyness * 0.15
+                call_bid = max(0.01, round(call_price * (1 - spread_half), 2))
+                call_ask = max(0.02, round(call_price * (1 + spread_half), 2))
+                put_bid = max(0.01, round(put_price * (1 - spread_half), 2))
+                put_ask = max(0.02, round(put_price * (1 + spread_half), 2))
+
+                # Delta
+                call_delta = max(0.01, min(0.99, nd1))
+                put_delta = max(0.01, min(0.99, 1.0 - nd1))  # Put delta magnitude = 1 - N(d1)
                 
                 calls[strike] = {
                     'bid': call_bid,
@@ -621,8 +636,8 @@ class BacktestEngine:
                     'last': call_price,
                     'iv': adjusted_iv,
                     'delta': call_delta,
-                    'volume': int(1000 * (1 - moneyness) ** 2),  # Higher volume for ATM
-                    'open_interest': int(5000 * (1 - moneyness) ** 2)
+                    'volume': int(1000 * max(0, 1 - abs_moneyness) ** 2),  # Higher volume for ATM
+                    'open_interest': int(5000 * max(0, 1 - abs_moneyness) ** 2)
                 }
                 
                 puts[strike] = {
@@ -631,8 +646,8 @@ class BacktestEngine:
                     'last': put_price,
                     'iv': adjusted_iv,
                     'delta': -put_delta,  # Put delta is negative
-                    'volume': int(1000 * (1 - moneyness) ** 2),
-                    'open_interest': int(5000 * (1 - moneyness) ** 2)
+                    'volume': int(1000 * max(0, 1 - abs_moneyness) ** 2),
+                    'open_interest': int(5000 * max(0, 1 - abs_moneyness) ** 2)
                 }
             
             option_chain[expiry_str] = {
