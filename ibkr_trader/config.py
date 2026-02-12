@@ -93,43 +93,32 @@ class RiskParameters:
         # Scale parameters according to risk level
         self.risk_level = level
         
-        # Lower risk means higher volatility threshold for entry - made even more selective
-        self.min_volatility_threshold = 28 + (10 - level) * 3.0  # Further increased from 25 + (10 - level) * 2.5
+        # Volatility threshold for entry - lower levels need higher VIX to trade
+        self.min_volatility_threshold = 15 + (10 - level) * 1.5
+
+        # Daily risk as percentage of portfolio
+        self.max_daily_risk_pct = 0.5 + level * 0.3
+
+        # Max position size as percentage of portfolio
+        self.max_position_size_pct = 2.0 + level * 1.5
+
+        # Max delta exposure
+        self.max_delta_exposure = 5 + level * 3
+
+        # Stop loss percentage
+        self.stop_loss_pct = 5 + level * 1.0
+
+        # Target profit percentage
+        self.target_profit_pct = 8 + level * 1.2
+
+        # Min volatility change to trigger a trade
+        self.min_volatility_change = 3.0 - (level * 0.15)
         
-        # Lower risk means lower daily risk - substantially more conservative
-        self.max_daily_risk_pct = 0.15 + level * 0.12  # Further reduced from 0.2 + level * 0.15
-        
-        # Lower risk means smaller position size - significantly reduced across all levels
-        self.max_position_size_pct = 1.0 + level * 0.7   # Further reduced from 1.2 + level * 0.8
-        
-        # Lower risk means lower delta exposure - dramatically reduced exposure
-        self.max_delta_exposure = 2.5 + level * 1.8  # Further reduced from 3 + level * 2
-        
-        # Lower risk means tighter stop loss - improved to prevent larger drawdowns
-        self.stop_loss_pct = 4 + level * 0.7  # Further reduced from 5 + level * 0.8
-        
-        # Lower risk means lower but more achievable target profit - more realistic targets
-        self.target_profit_pct = 7 + level * 0.8  # Further reduced from 8 + level * 1.0
-        
-        # Lower risk means requiring larger volatility changes to trade - more selective entry
-        self.min_volatility_change = 5.5 - (level * 0.18)  # Further increased from 5.0 - (level * 0.15)
-        
-        # Adjust Iron Condor risk parameters based on risk level
-        # Higher risk levels allow wider stop losses and higher profit targets
-        self.condor_stop_loss_factor_of_max_risk = 25.0 + level * 1.0  # Tighter stops for all levels
-        self.condor_profit_target_factor_of_credit = 90.0 - level * 1.5  # Take profits earlier at lower risk levels
-        
-        # Adjust Iron Condor risk parameters based on risk level
-        # Higher risk levels allow wider stop losses and higher profit targets
-        self.condor_stop_loss_factor_of_max_risk = 25.0 + level * 1.0  # Tighter stops for all levels
-        self.condor_profit_target_factor_of_credit = 90.0 - level * 1.5  # Take profits earlier at lower risk levels
-        
-        # Iron Condor specific adjustments
-        # More conservative stop loss for all risk levels
-        self.condor_stop_loss_factor_of_max_risk = 18 + (level * 1.5)  # Further reduced from 20 + (level * 2.0)
-        
-        # More achievable profit targets - take profits even earlier
-        self.condor_profit_target_factor_of_credit = 75 + (10 - level) * 3.0  # Further increased from 70 + (10 - level) * 3.5
+        # Iron Condor risk parameters based on risk level
+        # Stop loss as percentage of max risk - tighter at lower risk levels
+        self.condor_stop_loss_factor_of_max_risk = 18 + (level * 1.5)
+        # Profit target as percentage of credit received - take profits earlier at lower risk levels
+        self.condor_profit_target_factor_of_credit = 75 + (10 - level) * 3.0
 
 
 @dataclass
@@ -157,28 +146,27 @@ class TradingConfig:
 @dataclass
 class VolatilityHarvestingConfig:
     """Configuration for the Adaptive Volatility-Harvesting System."""
-    # IV/HV ratio threshold for signal generation - further increased for more selective entry
-    iv_hv_ratio_threshold: float = 1.6
-    
-    # Minimum IV required for trade entry - further increased to avoid low volatility periods
-    min_iv_threshold: float = 32.0
-    
+    # IV/HV ratio threshold for signal generation
+    iv_hv_ratio_threshold: float = 1.2
+
+    # Minimum IV required for trade entry
+    min_iv_threshold: float = 18.0
+
     # Use adaptive thresholds based on market conditions
     use_adaptive_thresholds: bool = True
-    
+
     # Range around calculated strikes for iron condor legs (percentage)
-    # Further increased for better protection
-    strike_width_pct: float = 8.0
-    
-    # Target delta for short options legs - further reduced for less directional exposure
-    target_short_delta: float = 0.22
-    
-    # Target delta for long options legs - further adjusted for better protection
-    target_long_delta: float = 0.09
-    
-    # Default days to expiration range - further adjusted for better time decay management
-    min_dte: int = 20
-    max_dte: int = 32
+    strike_width_pct: float = 5.0
+
+    # Target delta for short options legs (0.15-0.20 is standard for iron condors)
+    target_short_delta: float = 0.18
+
+    # Target delta for long options legs
+    target_long_delta: float = 0.08
+
+    # Days to expiration range (25-45 days is the sweet spot for theta decay)
+    min_dte: int = 21
+    max_dte: int = 45
 
 
 @dataclass

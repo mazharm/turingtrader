@@ -288,38 +288,44 @@ class VolatilityAnalyzer:
             else:
                 vix_trend = 'flat'
             
-            # Enhanced signal determination based on VIX state, regime, and trend
+            # Signal determination based on VIX state, regime, and trend
             signal = 'none'
-            
-            # Base signal on volatility level, trend, and the relationship between short and longer-term VIX
+
             if volatility_state in ('extreme', 'high'):
-                # In high volatility environments, we look for stabilization or decline
-                if vix_trend == 'strong_down':
-                    signal = 'strong_buy'  # Volatility dropping rapidly - good time to sell premium
-                elif vix_trend == 'down':
-                    signal = 'buy'  # Volatility declining - favorable for selling premium
-                elif vix_trend == 'flat' and current_vix > vix_sma_10:
-                    signal = 'hold'  # Elevated but stable volatility - cautious premium selling
+                # High vol: best for premium selling when stabilizing or declining
+                if vix_trend in ('strong_down', 'down'):
+                    signal = 'strong_buy'  # Declining vol = ideal for selling premium
+                elif vix_trend == 'flat':
+                    signal = 'buy'  # Elevated but stable = still good for premium
                 else:
-                    signal = 'cash'  # Volatility still increasing - stay in cash
-                    
+                    signal = 'hold'  # Rising extreme vol = cautious but still tradable
+
             elif volatility_state == 'normal':
-                # In normal volatility, we want confirmed trends
-                if vix_trend in ('up', 'strong_up') and vix_change_pct_1d > 5:
-                    signal = 'buy'  # Volatility increasing from normal levels - good for premium selling
-                elif vix_trend == 'flat' and current_vix >= self.min_volatility_threshold:
-                    signal = 'hold'  # Stable, sufficient volatility - cautious premium selling
+                # Normal vol (18-25): bread and butter for iron condors
+                if vix_trend in ('up', 'strong_up'):
+                    signal = 'strong_buy'  # Rising from normal = expanding premium
+                elif vix_trend == 'flat':
+                    signal = 'buy'  # Stable normal vol = consistent premium selling
+                elif vix_trend == 'down' and current_vix >= 16:
+                    signal = 'hold'  # Declining but sufficient vol
                 else:
-                    signal = 'cash'  # Not enough volatility movement to justify trading
-                    
-            elif volatility_state in ('low', 'very_low'):
-                # In low volatility, we need strong upward moves
-                if vix_trend == 'strong_up' and vix_change_pct_1d > 8:
-                    signal = 'buy'  # Sharp volatility spike from low levels - opportunity for premium selling
-                elif vix_trend == 'up' and vix_change_pct_5d > 15:
-                    signal = 'hold'  # Sustained volatility increase - cautious premium selling
+                    signal = 'cash'
+
+            elif volatility_state == 'low':
+                # Low vol (13-18): selective trading
+                if vix_trend in ('up', 'strong_up'):
+                    signal = 'buy'  # Rising from low = emerging opportunity
+                elif current_vix >= 15:
+                    signal = 'hold'  # Borderline - trade if other conditions good
                 else:
-                    signal = 'cash'  # Volatility too low for effective premium selling
+                    signal = 'cash'
+
+            elif volatility_state == 'very_low':
+                # Very low vol (<13): mostly avoid
+                if vix_trend == 'strong_up':
+                    signal = 'hold'  # Spike from very low = potential opportunity
+                else:
+                    signal = 'cash'
             
             # Return enhanced analysis
             return {
@@ -465,10 +471,16 @@ class VolatilityAnalyzer:
         except Exception as e:
             self.logger.error(f"Error calculating probability of profit for spread: {e}")
             return 0.0
+
+    def _calculate_opportunity_score(self, iv: float, days_to_expiry: float,
+                                     volume: int, bid: float,
+                                     ask: float = None,
+                                     open_interest: int = None,
+                                     spread_pct: float = None) -> float:
         """
         Calculate a quality score for an option opportunity.
         Higher score means better opportunity.
-        
+
         Args:
             iv: Implied volatility (decimal)
             days_to_expiry: Days to expiration
@@ -477,51 +489,49 @@ class VolatilityAnalyzer:
             ask: Ask price (optional)
             open_interest: Open interest (optional)
             spread_pct: Bid-ask spread percentage (optional)
-            
+
         Returns:
             Quality score (0-100)
         """
         # IV score (higher IV is better, but with diminishing returns)
         iv_pct = iv * 100  # Convert to percentage
-        iv_score = min(45, iv_pct * 1.2)  # Cap at 45, reduced weighting to emphasize other factors
-        
+        iv_score = min(45, iv_pct * 1.2)
+
         # Days to expiry score (20-40 days is optimal for iron condors)
         dte_score = 0
         if 20 <= days_to_expiry <= 40:
-            dte_score = 25  # Optimal range - reduced from 30
+            dte_score = 25
         elif 15 <= days_to_expiry < 20 or 40 < days_to_expiry <= 50:
-            dte_score = 15  # Good range - reduced from 20
+            dte_score = 15
         else:
-            dte_score = 5   # Acceptable range - reduced from 10
-            
+            dte_score = 5
+
         # Volume score (higher volume means better liquidity)
-        volume_score = min(15, volume / 80)  # Increased weight from 10 to 15
-        
+        volume_score = min(15, volume / 80)
+
         # Bid price score (higher premium is better)
-        bid_score = min(15, bid * 4)  # Increased weight from 10 to 15
-        
+        bid_score = min(15, bid * 4)
+
         # Add open interest score if available
         oi_score = 0
         if open_interest is not None:
-            oi_score = min(10, open_interest / 100)  # New factor
-        
+            oi_score = min(10, open_interest / 100)
+
         # Add spread quality score if available
         spread_score = 0
         if spread_pct is not None and spread_pct > 0:
-            # Lower spread_pct is better (tighter spread)
             if spread_pct < 0.05:
-                spread_score = 15  # Excellent spread
+                spread_score = 15
             elif spread_pct < 0.10:
-                spread_score = 10  # Good spread
+                spread_score = 10
             elif spread_pct < 0.15:
-                spread_score = 5   # Acceptable spread
-        
+                spread_score = 5
+
         # Total score
         total_score = iv_score + dte_score + volume_score + bid_score + oi_score + spread_score
-        
-        # Return normalized score (0-100)
+
         return min(100, total_score)
-        
+
     def analyze_option_chain(self, chain_data: Dict) -> Dict:
         """
         Analyze option chain to find implied volatility and trading opportunities.
@@ -661,30 +671,29 @@ class VolatilityAnalyzer:
     def should_trade_today(self, vix_analysis: Dict) -> bool:
         """
         Determine if we should trade today based on volatility.
-        
+
         Args:
             vix_analysis: Result from analyze_vix()
-            
+
         Returns:
             bool: True if we should trade, False otherwise
         """
-        # More lenient logic for testing and backtesting
-        # In test mode, we want to trigger more trades for evaluation
         signal = vix_analysis.get('signal', 'none')
         volatility_state = vix_analysis.get('volatility_state', 'normal')
-        
-        # Allow trading for more signal types and volatility states
+        current_vix = vix_analysis.get('current_vix', 0.0)
+
+        # Trade when signals are favorable
         if signal in ['buy', 'strong_buy', 'hold']:
             return True
-            
-        # Also trade in high volatility states regardless of signal
+
+        # Trade in high volatility states (best for premium selling)
         if volatility_state in ['high', 'extreme']:
             return True
-            
-        # For testing backtests, add 25% random chance to trade anyway
-        if np.random.random() < 0.25:
+
+        # Trade in normal volatility when VIX is above our minimum threshold
+        if volatility_state == 'normal' and current_vix >= self.min_volatility_threshold:
             return True
-            
+
         return False
     
     def get_position_size_multiplier(self, vix_analysis: Dict) -> float:
@@ -735,11 +744,12 @@ class VolatilityAnalyzer:
         """
         if not self.use_adaptive_thresholds:
             return
-            
-        # Add to history for tracking VIX changes
-        self.vix_history.append(current_vix)
-        if len(self.vix_history) > 30:  # Keep last 30 days
-            self.vix_history.pop(0)
+
+        # Only append if not already tracked by analyze_vix
+        if not self.vix_history or self.vix_history[-1] != current_vix:
+            self.vix_history.append(current_vix)
+            if len(self.vix_history) > 100:
+                self.vix_history = self.vix_history[-100:]
             
         # Calculate VIX statistics for more nuanced adaptation
         vix_history = np.array(self.vix_history)

@@ -584,12 +584,11 @@ class RiskManager:
         # Determine market close time (assuming 4:00 PM Eastern)
         market_close = time(16, 0)
         
-        # Calculate cutoff time
-        cutoff_minutes = int(end_offset_hours * 60)
-        cutoff_time = time(
-            (market_close.hour - cutoff_minutes // 60) % 24,
-            (market_close.minute - cutoff_minutes % 60) % 60
-        )
+        # Calculate cutoff time using timedelta for correct arithmetic
+        from datetime import timedelta as td
+        market_close_dt = datetime.combine(current_time.date(), market_close)
+        cutoff_dt = market_close_dt - td(minutes=int(end_offset_hours * 60))
+        cutoff_time = cutoff_dt.time()
         
         # Check if current time is past cutoff
         return current_time.time() >= cutoff_time

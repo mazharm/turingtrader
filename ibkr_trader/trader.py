@@ -705,10 +705,11 @@ class TuringTrader:
         )
         
         # Execute trade if appropriate
-        if trade_decision.get('action') == 'buy':
+        action = trade_decision.get('action', 'none')
+        if action in ('buy', 'iron_condor', 'vertical_spread'):
             execution_result = self.execute_trade(trade_decision)
             trade_decision['execution'] = execution_result
-        
+
         return {'action': 'decision', 'trade_decision': trade_decision}
     
     def run_trading_loop(self, max_cycles: int = -1, interval_seconds: int = 60) -> None:

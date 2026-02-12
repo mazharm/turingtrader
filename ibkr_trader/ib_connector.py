@@ -1017,7 +1017,9 @@ class IBConnector:
         except Exception as e:
             self.logger.error(f"Error submitting vertical spread order: {e}", exc_info=True)
             return None
-                        bag_contract: Bag, # Pass the qualified Bag contract of the open position
+
+    def close_iron_condor(self,
+                        bag_contract: 'Bag', # Pass the qualified Bag contract of the open position
                         quantity: int,
                         limit_price: Optional[float] = None, # This is the NET DEBIT to pay
                         max_attempts: int = 3,

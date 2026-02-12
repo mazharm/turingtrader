@@ -35,8 +35,8 @@ class TestParametersScaleWithRiskLevel:
 
     def test_min_volatility_threshold_scales(self, risk_level, risk_params_for_level):
         """Verify min_volatility_threshold decreases with higher risk."""
-        # Formula: 28 + (10 - level) * 3.0
-        expected = 28 + (10 - risk_level) * 3.0
+        # Formula: 15 + (10 - level) * 1.5
+        expected = 15 + (10 - risk_level) * 1.5
         assert risk_params_for_level.min_volatility_threshold == pytest.approx(expected, rel=0.01)
 
         # Lower risk should mean higher threshold (more selective)
@@ -47,8 +47,8 @@ class TestParametersScaleWithRiskLevel:
 
     def test_max_daily_risk_scales(self, risk_level, risk_params_for_level):
         """Verify max_daily_risk_pct increases with higher risk."""
-        # Formula: 0.15 + level * 0.12
-        expected = 0.15 + risk_level * 0.12
+        # Formula: 0.5 + level * 0.3
+        expected = 0.5 + risk_level * 0.3
         assert risk_params_for_level.max_daily_risk_pct == pytest.approx(expected, rel=0.01)
 
         # Higher risk should allow more daily risk
@@ -59,32 +59,32 @@ class TestParametersScaleWithRiskLevel:
 
     def test_max_position_size_scales(self, risk_level, risk_params_for_level):
         """Verify max_position_size_pct increases with higher risk."""
-        # Formula: 1.0 + level * 0.7
-        expected = 1.0 + risk_level * 0.7
+        # Formula: 2.0 + level * 1.5
+        expected = 2.0 + risk_level * 1.5
         assert risk_params_for_level.max_position_size_pct == pytest.approx(expected, rel=0.01)
 
     def test_max_delta_exposure_scales(self, risk_level, risk_params_for_level):
         """Verify max_delta_exposure increases with higher risk."""
-        # Formula: 2.5 + level * 1.8
-        expected = 2.5 + risk_level * 1.8
+        # Formula: 5 + level * 3
+        expected = 5 + risk_level * 3
         assert risk_params_for_level.max_delta_exposure == pytest.approx(expected, rel=0.01)
 
     def test_stop_loss_scales(self, risk_level, risk_params_for_level):
         """Verify stop_loss_pct increases with higher risk (wider stops)."""
-        # Formula: 4 + level * 0.7
-        expected = 4 + risk_level * 0.7
+        # Formula: 5 + level * 1.0
+        expected = 5 + risk_level * 1.0
         assert risk_params_for_level.stop_loss_pct == pytest.approx(expected, rel=0.01)
 
     def test_target_profit_scales(self, risk_level, risk_params_for_level):
         """Verify target_profit_pct increases with higher risk."""
-        # Formula: 7 + level * 0.8
-        expected = 7 + risk_level * 0.8
+        # Formula: 8 + level * 1.2
+        expected = 8 + risk_level * 1.2
         assert risk_params_for_level.target_profit_pct == pytest.approx(expected, rel=0.01)
 
     def test_min_volatility_change_scales(self, risk_level, risk_params_for_level):
         """Verify min_volatility_change decreases with higher risk."""
-        # Formula: 5.5 - (level * 0.18)
-        expected = 5.5 - (risk_level * 0.18)
+        # Formula: 3.0 - (level * 0.15)
+        expected = 3.0 - (risk_level * 0.15)
         assert risk_params_for_level.min_volatility_change == pytest.approx(expected, rel=0.01)
 
     def test_condor_stop_loss_factor_scales(self, risk_level, risk_params_for_level):

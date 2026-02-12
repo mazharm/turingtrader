@@ -228,100 +228,284 @@ class BacktestEngine:
             self.current_balance
         )
         
-        # Execute the trade if it's a buy signal
-        if trade_decision.get('action') == 'buy':
+        # Execute the trade for any actionable signal
+        action = trade_decision.get('action', 'none')
+        if action in ('buy', 'iron_condor', 'vertical_spread'):
             # Simulate trade execution
             self._execute_trade(date, trade_decision, current_price)
     
     def _close_positions(self, date: datetime, current_price: float) -> None:
         """
         Close all positions at the end of day.
-        
+
         Args:
             date: Trading date
             current_price: Current price of the underlying
         """
         if not self.positions:
             return
-            
+
         self.logger.debug(f"Closing {len(self.positions)} positions on {date.strftime('%Y-%m-%d')}")
-        
-        # For each position, calculate P&L
+
         for symbol, position in list(self.positions.items()):
-            # Simulate exit price based on underlying price movement
-            underlying_change = (current_price / position['underlying_price']) - 1.0
-            
-            # Apply a multiplier based on option type and delta
-            if position['option_type'] == 'call':
-                price_multiplier = 2.5 if underlying_change > 0 else 1.5
-            else:  # put
-                price_multiplier = 2.5 if underlying_change < 0 else 1.5
-                underlying_change = -underlying_change  # Reverse for puts
-            
-            # Calculate option price change (with some randomness for realism)
-            option_change = underlying_change * price_multiplier * (1 + np.random.normal(0, 0.1))
-            
-            # Ensure we don't go below zero
-            exit_price = max(0.01, position['entry_price'] * (1 + option_change))
-            
-            # Calculate P&L
-            pnl = (exit_price - position['entry_price']) * position['quantity'] * 100
-            
-            # Update balance
+            strategy = position.get('strategy', 'single_option')
+
+            if strategy == 'iron_condor':
+                pnl = self._close_iron_condor(position, current_price)
+            elif strategy == 'vertical_spread':
+                pnl = self._close_vertical_spread(position, current_price)
+            else:
+                pnl = self._close_single_option(position, current_price)
+
             self.current_balance += pnl
-            
-            # Record trade
+
             trade_record = {
                 'date': date,
                 'symbol': symbol,
-                'action': 'sell',
+                'action': 'close',
                 'quantity': position['quantity'],
-                'price': exit_price,
                 'pnl': pnl,
                 'balance': self.current_balance
             }
-            
             self.trade_history.append(trade_record)
             self.logger.debug(f"Closed position {symbol} with P&L: ${pnl:.2f}")
-            
-        # Clear positions
+
         self.positions = {}
-    
+
+    def _close_iron_condor(self, position: Dict, current_price: float) -> float:
+        """Calculate P&L for closing an iron condor position."""
+        short_put = position['short_put_strike']
+        short_call = position['short_call_strike']
+        long_put = position['long_put_strike']
+        long_call = position['long_call_strike']
+        net_credit = position['net_credit']
+        quantity = position['quantity']
+        max_width = position.get('max_width', short_call - short_put)
+
+        # Determine payout based on where price ended
+        if short_put <= current_price <= short_call:
+            # Price within short strikes - max profit (keep full credit)
+            pnl_per_spread = net_credit
+        elif current_price < long_put:
+            # Price below long put - max loss on put side
+            put_width = short_put - long_put
+            pnl_per_spread = net_credit - put_width
+        elif current_price > long_call:
+            # Price above long call - max loss on call side
+            call_width = long_call - short_call
+            pnl_per_spread = net_credit - call_width
+        elif current_price < short_put:
+            # Price between long put and short put - partial loss on put side
+            intrusion = short_put - current_price
+            pnl_per_spread = net_credit - intrusion
+        else:
+            # Price between short call and long call - partial loss on call side
+            intrusion = current_price - short_call
+            pnl_per_spread = net_credit - intrusion
+
+        return pnl_per_spread * quantity * 100
+
+    def _close_vertical_spread(self, position: Dict, current_price: float) -> float:
+        """Calculate P&L for closing a vertical spread position."""
+        short_strike = position['short_strike']
+        long_strike = position['long_strike']
+        net_credit = position['net_credit']
+        quantity = position['quantity']
+        spread_type = position.get('spread_type', 'bull_put')
+
+        if spread_type == 'bull_put':
+            # Bull put spread: profit if price stays above short put
+            if current_price >= short_strike:
+                pnl_per_spread = net_credit  # Keep full credit
+            elif current_price <= long_strike:
+                width = short_strike - long_strike
+                pnl_per_spread = net_credit - width  # Max loss
+            else:
+                intrusion = short_strike - current_price
+                pnl_per_spread = net_credit - intrusion
+        elif spread_type == 'bear_call':
+            # Bear call spread: profit if price stays below short call
+            if current_price <= short_strike:
+                pnl_per_spread = net_credit  # Keep full credit
+            elif current_price >= long_strike:
+                width = long_strike - short_strike
+                pnl_per_spread = net_credit - width  # Max loss
+            else:
+                intrusion = current_price - short_strike
+                pnl_per_spread = net_credit - intrusion
+        else:
+            pnl_per_spread = net_credit * 0.5  # Fallback
+
+        return pnl_per_spread * quantity * 100
+
+    def _close_single_option(self, position: Dict, current_price: float) -> float:
+        """Calculate P&L for closing a single option position."""
+        underlying_change = (current_price / position['underlying_price']) - 1.0
+
+        if position.get('option_type', 'call') == 'call':
+            price_multiplier = 2.5 if underlying_change > 0 else 1.5
+        else:
+            price_multiplier = 2.5 if underlying_change < 0 else 1.5
+            underlying_change = -underlying_change
+
+        option_change = underlying_change * price_multiplier
+        exit_price = max(0.01, position['entry_price'] * (1 + option_change))
+        return (exit_price - position['entry_price']) * position['quantity'] * 100
+
     def _execute_trade(self, date: datetime, trade_decision: Dict, current_price: float) -> None:
         """
         Execute a trade in the backtest.
-        
+
         Args:
             date: Trading date
             trade_decision: Trade decision details
             current_price: Current price of the underlying
         """
-        # Extract trade details
+        action = trade_decision.get('action', 'buy')
+
+        if action == 'iron_condor':
+            self._execute_iron_condor(date, trade_decision, current_price)
+        elif action == 'vertical_spread':
+            self._execute_vertical_spread(date, trade_decision, current_price)
+        else:
+            self._execute_single_option(date, trade_decision, current_price)
+
+    def _execute_iron_condor(self, date: datetime, trade_decision: Dict, current_price: float) -> None:
+        """Execute an iron condor trade in the backtest."""
+        symbol = trade_decision.get('symbol', self.options_strategy.index_symbol)
+        expiry = trade_decision.get('expiry', '')
+        quantity = trade_decision.get('quantity', 1)
+        net_credit = trade_decision.get('net_credit', 0.0)
+        short_call = trade_decision.get('short_call_strike', 0)
+        short_put = trade_decision.get('short_put_strike', 0)
+        long_call = trade_decision.get('long_call_strike', 0)
+        long_put = trade_decision.get('long_put_strike', 0)
+        max_risk = trade_decision.get('max_risk_per_spread', trade_decision.get('max_risk', 0))
+
+        # Margin required is the max risk per spread
+        margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+
+        if margin_required > self.current_balance * 0.5:
+            # Reduce quantity to fit within 50% of balance
+            quantity = max(1, int(self.current_balance * 0.5 / (margin_required / quantity)))
+            margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+
+        if quantity <= 0 or margin_required > self.current_balance:
+            return
+
+        position_id = f"{symbol}_IC_{expiry}_{short_put}P_{short_call}C"
+        max_width = min(short_call - short_put, long_call - short_call) if short_call > short_put else 5.0
+
+        position = {
+            'strategy': 'iron_condor',
+            'symbol': symbol,
+            'expiry': expiry,
+            'quantity': quantity,
+            'net_credit': net_credit,
+            'short_call_strike': short_call,
+            'short_put_strike': short_put,
+            'long_call_strike': long_call,
+            'long_put_strike': long_put,
+            'max_width': max_width,
+            'entry_date': date,
+            'underlying_price': current_price
+        }
+
+        self.positions[position_id] = position
+
+        # Credit received (added to balance)
+        credit_received = net_credit * quantity * 100
+        self.current_balance += credit_received
+
+        trade_record = {
+            'date': date,
+            'symbol': position_id,
+            'action': 'iron_condor',
+            'quantity': quantity,
+            'price': net_credit,
+            'cost': -credit_received,
+            'balance': self.current_balance
+        }
+        self.trade_history.append(trade_record)
+
+        self.logger.debug(f"Executed Iron Condor: {quantity}x {position_id} credit: ${net_credit:.2f}")
+
+    def _execute_vertical_spread(self, date: datetime, trade_decision: Dict, current_price: float) -> None:
+        """Execute a vertical spread trade in the backtest."""
+        symbol = trade_decision.get('symbol', self.options_strategy.index_symbol)
+        spread_type = trade_decision.get('spread_type', 'bull_put')
+        expiry = trade_decision.get('expiry', '')
+        quantity = trade_decision.get('quantity', 1)
+        net_credit = trade_decision.get('net_credit', 0.0)
+        short_strike = trade_decision.get('short_strike', 0)
+        long_strike = trade_decision.get('long_strike', 0)
+        max_risk = trade_decision.get('max_risk_per_spread', trade_decision.get('max_risk', 0))
+
+        # Margin required is the max risk per spread
+        margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+
+        if margin_required > self.current_balance * 0.5:
+            quantity = max(1, int(self.current_balance * 0.5 / (margin_required / quantity)))
+            margin_required = max_risk * quantity * 100 if max_risk > 0 else net_credit * 3 * quantity * 100
+
+        if quantity <= 0 or margin_required > self.current_balance:
+            return
+
+        position_id = f"{symbol}_{spread_type}_{expiry}_{short_strike}_{long_strike}"
+
+        position = {
+            'strategy': 'vertical_spread',
+            'spread_type': spread_type,
+            'symbol': symbol,
+            'expiry': expiry,
+            'quantity': quantity,
+            'net_credit': net_credit,
+            'short_strike': short_strike,
+            'long_strike': long_strike,
+            'entry_date': date,
+            'underlying_price': current_price
+        }
+
+        self.positions[position_id] = position
+
+        # Credit received
+        credit_received = net_credit * quantity * 100
+        self.current_balance += credit_received
+
+        trade_record = {
+            'date': date,
+            'symbol': position_id,
+            'action': 'vertical_spread',
+            'quantity': quantity,
+            'price': net_credit,
+            'cost': -credit_received,
+            'balance': self.current_balance
+        }
+        self.trade_history.append(trade_record)
+
+        self.logger.debug(f"Executed {spread_type}: {quantity}x {position_id} credit: ${net_credit:.2f}")
+
+    def _execute_single_option(self, date: datetime, trade_decision: Dict, current_price: float) -> None:
+        """Execute a single option trade in the backtest."""
         symbol = trade_decision.get('symbol')
         expiry = trade_decision.get('expiry')
         strike = trade_decision.get('strike')
         option_type = trade_decision.get('option_type', 'call')
         quantity = trade_decision.get('quantity', 1)
         price = trade_decision.get('price', 0.0)
-        
-        # Calculate cost
-        cost = price * quantity * 100  # Options contracts represent 100 shares
-        
-        # Ensure we have enough balance
+
+        cost = price * quantity * 100
         if cost > self.current_balance:
-            self.logger.warning(f"Insufficient balance for trade: ${cost:.2f} needed, ${self.current_balance:.2f} available")
             quantity = int(self.current_balance / (price * 100))
             cost = price * quantity * 100
-            
             if quantity <= 0:
                 return
-        
-        # Update balance
+
         self.current_balance -= cost
-        
-        # Create position
         position_id = f"{symbol}_{option_type}_{expiry}_{strike}"
+
         position = {
+            'strategy': 'single_option',
             'symbol': symbol,
             'expiry': expiry,
             'strike': strike,
@@ -332,10 +516,8 @@ class BacktestEngine:
             'cost': cost,
             'underlying_price': current_price
         }
-        
         self.positions[position_id] = position
-        
-        # Record trade
+
         trade_record = {
             'date': date,
             'symbol': position_id,
@@ -345,9 +527,8 @@ class BacktestEngine:
             'cost': cost,
             'balance': self.current_balance
         }
-        
         self.trade_history.append(trade_record)
-        
+
         self.logger.debug(f"Executed trade: BUY {quantity} {symbol} {option_type} @ ${strike} "
                         f"for ${price:.2f} per contract, total cost: ${cost:.2f}")
     
@@ -481,7 +662,7 @@ class BacktestEngine:
         
         # Calculate metrics
         total_days = len(df)
-        trading_days = len([t for t in self.trade_history if t['action'] == 'buy'])
+        trading_days = len([t for t in self.trade_history if t['action'] in ('buy', 'iron_condor', 'vertical_spread')])
         total_return = ((self.current_balance / self.initial_balance) - 1.0) * 100
         
         # Annualized return (assuming 252 trading days per year)
@@ -493,16 +674,15 @@ class BacktestEngine:
         annualized_volatility = daily_volatility * np.sqrt(252) * 100 if not np.isnan(daily_volatility) else 0
         
         # Maximum drawdown
-        df['cumulative_return'] = (1 + df['return'])
-        df['running_max'] = df['cumulative_return'].cummax()
-        df['drawdown'] = (df['running_max'] - df['cumulative_return']) / df['running_max']
+        df['peak'] = df['balance'].cummax()
+        df['drawdown'] = (df['peak'] - df['balance']) / df['peak']
         max_drawdown = df['drawdown'].max() * 100
         
         # Sharpe ratio (assuming 0% risk-free rate for simplicity)
         sharpe_ratio = (annualized_return / annualized_volatility) if annualized_volatility > 0 else 0
         
         # Win rate
-        trades_df = pd.DataFrame([t for t in self.trade_history if t['action'] == 'sell'])
+        trades_df = pd.DataFrame([t for t in self.trade_history if t['action'] in ('sell', 'close')])
         if len(trades_df) > 0:
             trades_df['win'] = trades_df['pnl'] > 0
             win_rate = trades_df['win'].mean() * 100

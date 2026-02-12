@@ -594,7 +594,10 @@ class OptionsStrategy:
                     trade_decision = {'action': 'none', 'reason': 'low_trade_score'}
                 else:
                     self.logger.info(f"Iron condor trade score: {trade_score:.1f} - executing trade")
-            
+
+            if trade_decision.get('action') != 'none':
+                self.last_trade_time = datetime.now()
+                self.todays_trades.append(trade_decision)
             return trade_decision
             
         elif strategy == "vertical_spread" and spread_type is not None:
@@ -625,7 +628,10 @@ class OptionsStrategy:
                     trade_decision = {'action': 'none', 'reason': 'low_trade_score'}
                 else:
                     self.logger.info(f"Vertical spread trade score: {trade_score:.1f} - executing trade")
-            
+
+            if trade_decision.get('action') != 'none':
+                self.last_trade_time = datetime.now()
+                self.todays_trades.append(trade_decision)
             return trade_decision
         else:
             # No suitable strategy selected
@@ -634,12 +640,6 @@ class OptionsStrategy:
                 'action': 'none',
                 'reason': 'unfavorable_market_conditions'
             }
-            return trade_decision
-                       
-        self.last_trade_time = datetime.now()
-        self.todays_trades.append(trade_decision)
-        
-        return trade_decision
     
     def should_close_positions(self, current_time: Optional[datetime] = None) -> bool:
         """
@@ -1001,16 +1001,13 @@ class OptionsStrategy:
         # Calculate credit-to-risk ratio
         credit_to_risk_ratio = net_credit / max_width
         
-        # Calculate return on risk
+        # Calculate return on risk as percentage
         return_on_risk = (net_credit / max_risk) * 100
-        
+
         # Check return on risk threshold if specified
         if min_return_on_risk > 0 and return_on_risk < min_return_on_risk:
             self.logger.warning(f"Iron condor return on risk {return_on_risk:.2f}% is below minimum threshold {min_return_on_risk:.2f}%")
             return None
-        
-        # Calculate risk metrics
-        return_on_risk = net_credit / max_risk
         
         # Calculate probability of profit (approximate using delta)
         prob_profit = (1 - short_call_delta) * (1 - short_put_delta) * 100
