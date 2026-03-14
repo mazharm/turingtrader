@@ -51,6 +51,7 @@ backtests/
 
 # Node
 node_modules/
+*.tsbuildinfo
 
 # Dashboard data is committed (not ignored)
 !dashboard/public/data/
