@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""
+tt — TuringTrader backtest runner
+
+Usage:
+    tt init <name>                  Create a new backtest workspace
+    tt run <name>                   Run the backtest
+    tt publish <name>               Push results to the dashboard
+    tt list                         List all backtests
+
+Examples:
+    tt init aggressive-1yr
+    tt run aggressive-1yr
+    tt publish aggressive-1yr
+"""
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import sys
+import textwrap
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Repo root = directory containing this script
+REPO_ROOT = Path(__file__).resolve().parent
+BACKTESTS_DIR = REPO_ROOT / "backtests"
+DASHBOARD_DATA_DIR = REPO_ROOT / "dashboard" / "public" / "data"
+
+# Add repo root to path for imports
+sys.path.insert(0, str(REPO_ROOT))
+
+DEFAULT_CONFIG = {
+    "initial_investment": 100000,
+    "period_days": 365,
+    "start_date": None,
+    "end_date": None,
+    "risk_levels": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "data_source": "auto",
+    "strategies": ["iron_condor", "vertical_spread"],
+}
+
+
+def workspace_path(name: str) -> Path:
+    return BACKTESTS_DIR / name
+
+
+def load_config(ws: Path) -> dict:
+    config_file = ws / "config.json"
+    if not config_file.exists():
+        print(f"Error: No config.json in {ws}")
+        sys.exit(1)
+    with open(config_file) as f:
+        return json.load(f)
+
+
+def cmd_init(args):
+    """Create a new backtest workspace."""
+    ws = workspace_path(args.name)
+    if ws.exists():
+        print(f"Workspace '{args.name}' already exists at {ws}")
+        sys.exit(1)
+
+    ws.mkdir(parents=True)
+    (ws / "results").mkdir()
+
+    config = DEFAULT_CONFIG.copy()
+
+    # Apply overrides from CLI
+    if args.period:
+        config["period_days"] = args.period
+    if args.investment:
+        config["initial_investment"] = args.investment
+    if args.risk_levels:
+        config["risk_levels"] = [int(x) for x in args.risk_levels.split(",")]
+    if args.data_source:
+        config["data_source"] = args.data_source
+
+    with open(ws / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Created workspace: {ws}")
+    print(f"  Config: {ws / 'config.json'}")
+    print(f"  Results: {ws / 'results'}")
+    print(f"")
+    print(f"Edit config.json to customize, then run:")
+    print(f"  tt run {args.name}")
+
+
+def cmd_run(args):
+    """Run a backtest."""
+    ws = workspace_path(args.name)
+    if not ws.exists():
+        print(f"Workspace '{args.name}' not found. Run: tt init {args.name}")
+        sys.exit(1)
+
+    config = load_config(ws)
+    results_dir = ws / "results"
+
+    # Set up logging — verbose to file, quiet to console
+    log_file = ws / "backtest.log"
+    file_handler = logging.FileHandler(str(log_file), mode="w")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+
+    logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
+
+    # Only show our progress on console
+    tt_logger = logging.getLogger("tt")
+    tt_logger.setLevel(logging.INFO)
+    tt_console = logging.StreamHandler()
+    tt_console.setLevel(logging.INFO)
+    tt_console.setFormatter(logging.Formatter("  %(message)s"))
+    tt_logger.addHandler(tt_console)
+
+    # Suppress noisy engine loggers on console (they still go to the log file)
+    for noisy in [
+        "ibkr_trader", "backtesting", "monitoring", "historical_data",
+        "src", "utils", "urllib3", "yfinance",
+    ]:
+        logging.getLogger(noisy).setLevel(logging.CRITICAL)
+
+    # Determine date range
+    end_date = config.get("end_date") or datetime.now().strftime("%Y-%m-%d")
+    if config.get("start_date"):
+        start_date = config["start_date"]
+    else:
+        start_date = (
+            datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=config["period_days"])
+        ).strftime("%Y-%m-%d")
+
+    risk_levels = config.get("risk_levels", list(range(1, 11)))
+    initial = config.get("initial_investment", 100000)
+    data_source = config.get("data_source", "auto")
+
+    print(f"")
+    print(f"  Backtest: {args.name}")
+    print(f"  Period:   {start_date} to {end_date}")
+    print(f"  Capital:  ${initial:,.0f}")
+    print(f"  Levels:   {risk_levels}")
+    print(f"  Data:     {data_source}")
+    print(f"  Output:   {results_dir}")
+    print(f"", flush=True)
+
+    # Import heavy dependencies only when running
+    # (imports trigger DB connection attempts that log errors — suppression above handles it)
+    from ibkr_trader.config import Config as AppConfig, RiskParameters  # noqa: F811
+    from backtesting.backtest_engine import BacktestEngine
+    from backtesting.performance_analyzer import PerformanceAnalyzer
+
+    # Select data fetcher
+    data_fetcher = _make_data_fetcher(data_source)
+
+    app_config = AppConfig()
+    engine = BacktestEngine(
+        config=app_config,
+        initial_balance=initial,
+        data_fetcher=data_fetcher,
+    )
+    analyzer = PerformanceAnalyzer()
+
+    progress = logging.getLogger("tt")
+    results_by_risk = {}
+    for level in risk_levels:
+        progress.info(f"Running risk level {level}/{max(risk_levels)}...")
+        raw = engine.run_backtest(
+            start_date=start_date,
+            end_date=end_date,
+            risk_level=level,
+            use_cache=True,
+        )
+        if "error" in raw:
+            progress.error(f"Risk level {level} failed: {raw['error']}")
+            continue
+        enriched = analyzer.analyze_results(raw, risk_level=level)
+        results_by_risk[level] = enriched
+
+    if not results_by_risk:
+        print("No results generated.")
+        sys.exit(1)
+
+    # Write results using the same format as generate_dashboard_data.py
+    from scripts.generate_dashboard_data import build_summary, build_risk_level_file
+
+    summary = build_summary(results_by_risk, initial, start_date, end_date)
+    with open(results_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    for level, results in sorted(results_by_risk.items()):
+        data = build_risk_level_file(level, results)
+        with open(results_dir / f"risk_level_{level}.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+    # Print summary table
+    print(f"")
+    print(f"  {'Level':>5}  {'Return':>10}  {'Sharpe':>8}  {'Max DD':>8}  {'Win %':>7}  {'Trades':>7}")
+    print(f"  {'-----'}  {'----------'}  {'--------'}  {'--------'}  {'-------'}  {'-------'}")
+    for rl in summary["risk_levels"]:
+        ret = rl["total_return_pct"]
+        print(
+            f"  {rl['risk_level']:>5}  {ret:>+9.2f}%  {rl['sharpe_ratio']:>8.2f}"
+            f"  {rl['max_drawdown_pct']:>7.2f}%  {rl['win_rate']:>6.1f}%  {rl['total_trades']:>7}"
+        )
+
+    best = max(summary["risk_levels"], key=lambda r: r["sharpe_ratio"])
+    print(f"")
+    print(f"  Best Sharpe: Risk Level {best['risk_level']} ({best['sharpe_ratio']:.2f})")
+    print(f"  Results:     {results_dir}")
+    print(f"  Log:         {log_file}")
+    print(f"")
+    print(f"  To deploy: tt publish {args.name}")
+
+
+def cmd_publish(args):
+    """Copy results to the dashboard data directory."""
+    ws = workspace_path(args.name)
+    results_dir = ws / "results"
+
+    if not results_dir.exists() or not (results_dir / "summary.json").exists():
+        print(f"No results found. Run: tt run {args.name}")
+        sys.exit(1)
+
+    DASHBOARD_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for f in results_dir.glob("*.json"):
+        shutil.copy2(f, DASHBOARD_DATA_DIR / f.name)
+        count += 1
+
+    print(f"Copied {count} files to {DASHBOARD_DATA_DIR}")
+    print(f"")
+    print(f"To deploy to GitHub Pages:")
+    print(f"  git add dashboard/public/data/")
+    print(f"  git commit -m 'Update dashboard data from backtest: {args.name}'")
+    print(f"  git push")
+
+
+def cmd_list(_args):
+    """List all backtests."""
+    if not BACKTESTS_DIR.exists():
+        print("No backtests yet. Run: tt init <name>")
+        return
+
+    workspaces = sorted(p for p in BACKTESTS_DIR.iterdir() if p.is_dir())
+    if not workspaces:
+        print("No backtests yet. Run: tt init <name>")
+        return
+
+    print(f"")
+    print(f"  {'Name':<25}  {'Status':<12}  {'Config'}")
+    print(f"  {'-------------------------'}  {'------------'}  {'----------------------------------------'}")
+
+    for ws in workspaces:
+        config_file = ws / "config.json"
+        has_results = (ws / "results" / "summary.json").exists()
+        status = "completed" if has_results else "ready"
+
+        if config_file.exists():
+            with open(config_file) as f:
+                cfg = json.load(f)
+            desc = f"${cfg['initial_investment']:,.0f}, {cfg['period_days']}d, {len(cfg['risk_levels'])} levels"
+        else:
+            desc = "no config"
+
+        print(f"  {ws.name:<25}  {status:<12}  {desc}")
+
+    print(f"")
+
+
+def _make_data_fetcher(source: str):
+    """Create a data fetcher based on the source setting."""
+    if source == "mock":
+        from backtesting.realistic_mock_data import RealisticMockDataFetcher
+        return RealisticMockDataFetcher()
+
+    if source == "real":
+        from historical_data.data_fetcher import HistoricalDataFetcher
+        data_dir = str(REPO_ROOT / "data")
+        return HistoricalDataFetcher(data_dir=data_dir)
+
+    # auto: try real, fall back to mock
+    from historical_data.data_fetcher import HistoricalDataFetcher
+    data_dir = str(REPO_ROOT / "data")
+    fetcher = HistoricalDataFetcher(data_dir=data_dir)
+    try:
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        test = fetcher.fetch_data("SPY", start, end, use_cache=False, max_retries=2)
+        if not test.empty:
+            return fetcher
+    except Exception:
+        pass
+
+    logging.warning("Yahoo Finance unavailable, using realistic mock data")
+    from backtesting.realistic_mock_data import RealisticMockDataFetcher
+    return RealisticMockDataFetcher()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="tt",
+        description="TuringTrader backtest runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              tt init my-backtest
+              tt init aggressive --period 730 --investment 50000 --risk-levels 7,8,9,10
+              tt run my-backtest
+              tt publish my-backtest
+              tt list
+        """),
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    p_init = sub.add_parser("init", help="Create a new backtest workspace")
+    p_init.add_argument("name", help="Workspace name")
+    p_init.add_argument("--period", type=int, help="Backtest period in days (default: 365)")
+    p_init.add_argument("--investment", type=float, help="Initial investment (default: 100000)")
+    p_init.add_argument("--risk-levels", type=str, help="Comma-separated risk levels (default: 1-10)")
+    p_init.add_argument("--data-source", choices=["auto", "real", "mock"], help="Data source (default: auto)")
+
+    # run
+    p_run = sub.add_parser("run", help="Run a backtest")
+    p_run.add_argument("name", help="Workspace name")
+
+    # publish
+    p_pub = sub.add_parser("publish", help="Copy results to dashboard")
+    p_pub.add_argument("name", help="Workspace name")
+
+    # list
+    sub.add_parser("list", help="List all backtests")
+
+    args = parser.parse_args()
+
+    if args.command == "init":
+        cmd_init(args)
+    elif args.command == "run":
+        cmd_run(args)
+    elif args.command == "publish":
+        cmd_publish(args)
+    elif args.command == "list":
+        cmd_list(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

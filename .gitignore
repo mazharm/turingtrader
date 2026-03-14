@@ -46,6 +46,9 @@ reports/
 *.csv
 !requirements.txt
 
+# Backtest workspaces (local only, publish to dashboard via tt publish)
+backtests/
+
 # Node
 node_modules/
 
