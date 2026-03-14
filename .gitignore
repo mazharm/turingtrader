@@ -40,11 +40,17 @@ logs/
 *.log
 
 # Data, reports, and results
-data/
+/data/
 reports/
 *.pkl
 *.csv
 !requirements.txt
+
+# Node
+node_modules/
+
+# Dashboard data is committed (not ignored)
+!dashboard/public/data/
 
 # Configuration with potentially sensitive information
 config.ini
