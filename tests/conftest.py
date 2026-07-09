@@ -155,7 +155,9 @@ def all_risk_results() -> Dict[int, Dict]:
     Returns:
         Dict mapping risk levels (1-10) to their backtest results
     """
-    mock_fetcher = RealisticMockDataFetcher()
+    # Seeded so the statistical assertions in the integration tests are
+    # deterministic instead of fluctuating with the global RNG state.
+    mock_fetcher = RealisticMockDataFetcher(seed=20260708)
     results = {}
 
     for risk_level in range(1, 11):
@@ -183,8 +185,8 @@ def all_risk_results() -> Dict[int, Dict]:
 
 @pytest.fixture
 def mock_data_fetcher() -> RealisticMockDataFetcher:
-    """Create a RealisticMockDataFetcher instance for testing."""
-    return RealisticMockDataFetcher()
+    """Create a RealisticMockDataFetcher instance for testing (seeded for determinism)."""
+    return RealisticMockDataFetcher(seed=20260708)
 
 
 @pytest.fixture

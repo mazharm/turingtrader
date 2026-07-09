@@ -329,8 +329,8 @@ def evaluate_algorithm(args):
             total_return = result.get('total_return_pct', 0)
             max_drawdown = result.get('max_drawdown_pct', 0)
             sharpe = result.get('sharpe_ratio', 0)
-            trades = result.get('total_trades', 0)
-            win_rate = result.get('win_rate', 0) * 100
+            trades = result.get('trades', 0)
+            win_rate = result.get('win_rate', 0)  # engine already reports percent
             
             print(f"{risk_level:4d} | {total_return:10.2f} | {max_drawdown:10.2f} | {sharpe:6.2f} | {trades:6d} | {win_rate:5.1f}")
     

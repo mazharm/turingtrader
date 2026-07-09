@@ -186,9 +186,10 @@ def cmd_run(args):
         sys.exit(1)
 
     # Write results using the same format as generate_dashboard_data.py
-    from scripts.generate_dashboard_data import build_summary, build_risk_level_file
+    from scripts.generate_dashboard_data import build_summary, build_risk_level_file, describe_data_source
 
-    summary = build_summary(results_by_risk, initial, start_date, end_date)
+    summary = build_summary(results_by_risk, initial, start_date, end_date,
+                            describe_data_source(data_fetcher))
     with open(results_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 

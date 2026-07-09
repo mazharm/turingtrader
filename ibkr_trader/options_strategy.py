@@ -38,9 +38,10 @@ class OptionsStrategy:
         self.config = config or Config()
         self.volatility_analyzer = volatility_analyzer or VolatilityAnalyzer(self.config)
         self.risk_manager = risk_manager or RiskManager(self.config)
-        
-        # Initialize market data store if available
-        self.market_data_store = MarketDataStore(self.config) if MarketDataStore else None
+
+        # Reuse the analyzer's market data store rather than opening a second
+        # set of database connections.
+        self.market_data_store = getattr(self.volatility_analyzer, 'market_data_store', None)
         
         # Default parameters
         self.index_symbol = self.config.trading.index_symbol
@@ -668,13 +669,38 @@ class OptionsStrategy:
         self.risk_manager.reset_daily_metrics()
         self.logger.info("Daily state reset for new trading day")
 
+    @staticmethod
+    def _select_affordable_leg(candidates: List[Dict],
+                               short_bid: float,
+                               max_risk_budget: Optional[float]) -> Optional[Dict]:
+        """
+        Pick the best-scoring long-leg candidate, preferring candidates whose
+        worst-case spread risk fits within the per-trade risk budget.
+
+        A candidate's worst-case risk per contract is (width - side credit) * 100,
+        with the side credit estimated as the short leg's bid minus the
+        candidate's ask. When no candidate fits, the best-scoring one is
+        returned and position sizing decides whether the trade is affordable.
+        """
+        if not candidates:
+            return None
+        ranked = sorted(candidates, key=lambda c: c['score'], reverse=True)
+        if not max_risk_budget or max_risk_budget <= 0:
+            return ranked[0]
+        affordable = [
+            c for c in ranked
+            if (c['width'] - max(0.0, short_bid - c['ask'])) * 100 <= max_risk_budget
+        ]
+        return affordable[0] if affordable else ranked[0]
+
     def find_iron_condor_legs(
         self,
         option_chain: Dict,
         current_price: float,
         expiry_target: Optional[str] = None,
         min_credit: float = 0.0,
-        min_return_on_risk: float = 0.0
+        min_return_on_risk: float = 0.0,
+        max_risk_budget: Optional[float] = None
     ) -> Optional[Dict]:
         """
         Find appropriate legs for an iron condor spread.
@@ -967,12 +993,10 @@ class OptionsStrategy:
             self.logger.warning("Could not find appropriate long legs with good liquidity for iron condor")
             return None
             
-        # Select best long call and put candidates based on score
-        long_call_candidates.sort(key=lambda x: x['score'], reverse=True)
-        long_put_candidates.sort(key=lambda x: x['score'], reverse=True)
-        
-        long_call = long_call_candidates[0]
-        long_put = long_put_candidates[0]
+        # Select long call and put, preferring wings whose worst-case risk
+        # fits the per-trade risk budget (narrower wings when budget is tight)
+        long_call = self._select_affordable_leg(long_call_candidates, short_call['bid'], max_risk_budget)
+        long_put = self._select_affordable_leg(long_put_candidates, short_put['bid'], max_risk_budget)
         
         long_call_strike = long_call['strike']
         long_put_strike = long_put['strike']
@@ -995,9 +1019,10 @@ class OptionsStrategy:
         # Calculate max risk (width between strikes minus credit received)
         call_spread_width = long_call_strike - short_call_strike
         put_spread_width = short_put_strike - long_put_strike
-        
-        # Use smaller of the two widths for max risk calculation to be conservative
-        max_width = min(call_spread_width, put_spread_width)
+
+        # Worst-case loss happens on the WIDER side: that side's width minus
+        # the total credit. Using the smaller width understates the risk.
+        max_width = max(call_spread_width, put_spread_width)
         max_risk = max_width - net_credit
         
         if max_risk <= 0:
@@ -1053,17 +1078,20 @@ class OptionsStrategy:
         option_chain: Dict,
         current_price: float,
         spread_type: str = 'bull_put',  # 'bull_put', 'bear_call', 'bull_call', 'bear_put'
-        expiry_target: Optional[str] = None
+        expiry_target: Optional[str] = None,
+        max_risk_budget: Optional[float] = None
     ) -> Optional[Dict]:
         """
         Find appropriate legs for a vertical spread.
-        
+
         Args:
             option_chain: Option chain data
             current_price: Current price of the underlying
             spread_type: Type of vertical spread to find
             expiry_target: Target expiry date (if None, will select based on DTE range)
-            
+            max_risk_budget: Per-trade risk budget in dollars; steers long-leg
+                selection toward widths whose worst-case loss fits the budget
+
         Returns:
             Dictionary with vertical spread leg details or None if no suitable legs found
         """
@@ -1255,10 +1283,9 @@ class OptionsStrategy:
             if not long_candidates:
                 self.logger.warning("No suitable long leg found for bull put spread")
                 return None
-            
-            # Select best long candidate
-            long_candidates.sort(key=lambda x: x['score'], reverse=True)
-            long_leg = long_candidates[0]
+
+            # Select long leg, preferring widths affordable within the risk budget
+            long_leg = self._select_affordable_leg(long_candidates, short_leg['bid'], max_risk_budget)
             long_strike = long_leg['strike']
             
             # Calculate spread details
@@ -1391,10 +1418,9 @@ class OptionsStrategy:
             if not long_candidates:
                 self.logger.warning("No suitable long leg found for bear call spread")
                 return None
-            
-            # Select best long candidate
-            long_candidates.sort(key=lambda x: x['score'], reverse=True)
-            long_leg = long_candidates[0]
+
+            # Select long leg, preferring widths affordable within the risk budget
+            long_leg = self._select_affordable_leg(long_candidates, short_leg['bid'], max_risk_budget)
             long_strike = long_leg['strike']
             
             # Calculate spread details
@@ -1458,21 +1484,12 @@ class OptionsStrategy:
         Returns:
             Dictionary with trade decision
         """
-        # Find vertical spread legs
-        vertical_spread = self.find_vertical_spread_legs(option_chain, current_price, spread_type)
-        
-        if not vertical_spread:
-            self.logger.info(f"No suitable {spread_type} vertical spread found")
-            return {
-                'action': 'none',
-                'reason': f'no_suitable_{spread_type}_spread'
-            }
-        
-        # Get position size multiplier
+        # Get position size multiplier first so the per-trade risk budget is
+        # known before leg selection and can steer it to affordable widths
         vol_harvest_analysis = self.volatility_analyzer.analyze_volatility_for_harvesting(
             self.index_symbol, vix_analysis, option_chain
         )
-        
+
         # More conservative position sizing for vertical spreads
         position_size_multiplier = 0.0
         if vol_harvest_analysis['signal'] == 'strong_volatility_harvest':
@@ -1481,7 +1498,28 @@ class OptionsStrategy:
             position_size_multiplier = 0.6
         else:
             position_size_multiplier = 0.4
-            
+
+        # Risk allocation - use a percentage of the max daily risk
+        # More conservative allocation for vertical spreads
+        risk_allocation_pct = 0.7  # Use 70% of max daily risk for vertical spreads
+        daily_risk_limit = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0)
+        max_risk_amount = daily_risk_limit * position_size_multiplier * risk_allocation_pct
+
+        # Find vertical spread legs. Width must fit the risk level's daily
+        # limit so one contract never exceeds what the level allows per day.
+        vertical_spread = self.find_vertical_spread_legs(
+            option_chain, current_price, spread_type,
+            max_risk_budget=daily_risk_limit
+        )
+
+        if not vertical_spread:
+            self.logger.info(f"No suitable {spread_type} vertical spread found")
+            return {
+                'action': 'none',
+                'reason': f'no_suitable_{spread_type}_spread'
+            }
+
+
         # Additional checks for vertical spreads
         # Minimum credit requirements
         if min_credit > 0 and vertical_spread['net_credit'] < min_credit:
@@ -1514,19 +1552,27 @@ class OptionsStrategy:
                 'threshold': min_prob_profit
             }
             
-        # Calculate quantity based on risk management
-        # For vertical spreads, max loss is width - credit received
+        # Calculate quantity from the per-trade risk budget. The weak-signal
+        # multipliers may allow less than one contract; a single contract is
+        # still permitted as long as it fits the level's daily risk limit,
+        # but a trade whose one-contract risk exceeds that limit is skipped
+        # (the old forced minimum silently breached conservative budgets).
         max_risk_per_spread = vertical_spread['max_risk']  # Already in dollars (width - credit) * 100
-        
-        # Risk allocation - use a percentage of the max daily risk
-        # More conservative allocation for vertical spreads
-        risk_allocation_pct = 0.7  # Use 70% of max daily risk for vertical spreads
-        max_risk_amount = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0) * position_size_multiplier * risk_allocation_pct
-        
-        # Calculate quantity
-        quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 1
-        quantity = max(1, quantity)  # At least 1 contract
-        
+        quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 0
+
+        if quantity < 1:
+            if max_risk_per_spread <= daily_risk_limit:
+                quantity = 1
+            else:
+                self.logger.info(f"Vertical spread risk ${max_risk_per_spread:.0f}/contract exceeds "
+                                 f"daily risk limit ${daily_risk_limit:.0f}; skipping trade")
+                return {
+                    'action': 'none',
+                    'reason': 'insufficient_risk_budget',
+                    'max_risk_per_spread': max_risk_per_spread,
+                    'risk_budget': daily_risk_limit
+                }
+
         # Cap quantity based on account size (risk no more than 5% per trade)
         max_quantity_by_account = max(1, int(account_value * 0.05 / max_risk_per_spread))
         quantity = min(quantity, max_quantity_by_account)
@@ -1570,10 +1616,9 @@ class OptionsStrategy:
                        f"total credit: ${total_credit:.2f}, "
                        f"max loss: ${max_loss:.2f}, "
                        f"prob profit: {vertical_spread['prob_profit']:.2f}%")
-                       
-        self.last_trade_time = datetime.now()
-        self.todays_trades.append(trade_decision)
-        
+
+        # NOTE: generate_trade_decision records accepted trades in todays_trades;
+        # recording here as well double-counted every vertical spread.
         return trade_decision
     
     def generate_iron_condor_trade(
@@ -1599,26 +1644,12 @@ class OptionsStrategy:
         Returns:
             Dictionary with trade decision
         """
-        # Find iron condor legs
-        iron_condor = self.find_iron_condor_legs(
-            option_chain, 
-            current_price,
-            min_credit=min_credit,
-            min_return_on_risk=min_return_on_risk
-        )
-        
-        if not iron_condor:
-            self.logger.info("No suitable iron condor found")
-            return {
-                'action': 'none',
-                'reason': 'no_suitable_iron_condor'
-            }
-        
-        # Get position size multiplier
+        # Get position size multiplier first so the per-trade risk budget is
+        # known before leg selection and can steer it to affordable widths
         vol_harvest_analysis = self.volatility_analyzer.analyze_volatility_for_harvesting(
             self.index_symbol, vix_analysis, option_chain
         )
-        
+
         # More conservative position sizing with further reduction
         position_size_multiplier = 0.0
         if vol_harvest_analysis['signal'] == 'strong_volatility_harvest':
@@ -1627,14 +1658,36 @@ class OptionsStrategy:
             position_size_multiplier = 0.35  # Reduced from 0.4
         else:
             position_size_multiplier = 0.15  # Reduced from 0.2
-        
+
         # Apply an additional safety factor based on the volatility regime
         volatility_state = vix_analysis.get('volatility_state', 'normal')
         if volatility_state == 'extreme':
             position_size_multiplier *= 0.5  # Further reduce by 50% in extreme volatility
         elif volatility_state == 'high':
             position_size_multiplier *= 0.7  # Further reduce by 30% in high volatility
-        
+
+        # Risk only what we're willing to lose (max risk * quantity)
+        # More conservative risk allocation - additional 0.7 factor (further reduced from 0.8)
+        daily_risk_limit = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0)
+        max_risk_amount = daily_risk_limit * position_size_multiplier * 0.7
+
+        # Find iron condor legs. Wing width must fit the risk level's daily
+        # limit so one contract never exceeds what the level allows per day.
+        iron_condor = self.find_iron_condor_legs(
+            option_chain,
+            current_price,
+            min_credit=min_credit,
+            min_return_on_risk=min_return_on_risk,
+            max_risk_budget=daily_risk_limit
+        )
+
+        if not iron_condor:
+            self.logger.info("No suitable iron condor found")
+            return {
+                'action': 'none',
+                'reason': 'no_suitable_iron_condor'
+            }
+
         # Additional check for return on risk - higher threshold for better risk/reward
         if iron_condor['return_on_risk'] < min_return_on_risk:
             self.logger.info(f"Iron condor return on risk too low: {iron_condor['return_on_risk']:.2f}% < {min_return_on_risk:.2f}%")
@@ -1686,15 +1739,27 @@ class OptionsStrategy:
                 'threshold': min_prob_profit
             }
         
-        # Risk only what we're willing to lose (max risk * quantity)
-        # More conservative risk allocation - additional 0.7 factor (further reduced from 0.8)
-        max_risk_amount = account_value * (self.risk_manager.risk_params.max_daily_risk_pct / 100.0) * position_size_multiplier * 0.7
-        
-        # Calculate quantity
+        # Calculate quantity from the per-trade risk budget. The weak-signal
+        # multipliers may allow less than one contract; a single contract is
+        # still permitted as long as it fits the level's daily risk limit,
+        # but a trade whose one-contract risk exceeds that limit is skipped
+        # (the old forced minimum silently breached conservative budgets).
         max_risk_per_spread = iron_condor['max_risk'] * 100  # Convert to dollars (per contract)
-        quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 1
-        quantity = max(1, quantity)  # At least 1 contract
-        
+        quantity = int(max_risk_amount / max_risk_per_spread) if max_risk_per_spread > 0 else 0
+
+        if quantity < 1:
+            if max_risk_per_spread <= daily_risk_limit:
+                quantity = 1
+            else:
+                self.logger.info(f"Iron condor risk ${max_risk_per_spread:.0f}/contract exceeds "
+                                 f"daily risk limit ${daily_risk_limit:.0f}; skipping trade")
+                return {
+                    'action': 'none',
+                    'reason': 'insufficient_risk_budget',
+                    'max_risk_per_spread': max_risk_per_spread,
+                    'risk_budget': daily_risk_limit
+                }
+
         # Cap quantity based on account size (risk no more than 5% of account per trade)
         max_quantity_by_account = max(1, int(account_value * 0.05 / max_risk_per_spread))
         quantity = min(quantity, max_quantity_by_account)
@@ -1740,10 +1805,9 @@ class OptionsStrategy:
                        f"total credit: ${total_credit:.2f}, "
                        f"max risk: ${max_loss:.2f}, "
                        f"prob profit: {iron_condor.get('prob_profit', 0):.2f}%")
-                       
-        self.last_trade_time = datetime.now()
-        self.todays_trades.append(trade_decision)
-        
+
+        # NOTE: generate_trade_decision records accepted trades in todays_trades;
+        # recording here as well double-counted every iron condor.
         return trade_decision
 
 

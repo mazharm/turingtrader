@@ -17,6 +17,16 @@ from ibkr_trader.options_strategy import OptionsStrategy
 from historical_data.data_fetcher import HistoricalDataFetcher
 
 
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF approximation (Abramowitz & Stegun)."""
+    a = 0.4361836
+    b = -0.1201676
+    c = 0.9372980
+    k = 1.0 / (1.0 + 0.33267 * abs(x))
+    cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * (a * k + b * k * k + c * k * k * k)
+    return cdf if x >= 0 else 1.0 - cdf
+
+
 class BacktestEngine:
     """Engine for backtesting the TuringTrader algorithm."""
     
@@ -27,11 +37,12 @@ class BacktestEngine:
         risk_manager: Optional[RiskManager] = None,
         options_strategy: Optional[OptionsStrategy] = None,
         initial_balance: float = 100000.0,
-        data_fetcher: Optional[Any] = None  # Added data_fetcher argument
+        data_fetcher: Optional[Any] = None,  # Added data_fetcher argument
+        holding_days: int = 1
     ):
         """
         Initialize the backtesting engine.
-        
+
         Args:
             config: Configuration object
             volatility_analyzer: Volatility analyzer instance
@@ -39,6 +50,9 @@ class BacktestEngine:
             options_strategy: Options strategy instance
             initial_balance: Initial account balance
             data_fetcher: Data fetcher instance (e.g., HistoricalDataFetcher or MockDataFetcher)
+            holding_days: Trading days a position is held before it is closed.
+                Positions always settle at expiry if that comes first. The
+                default of 1 preserves the strategy's daily open/close cycle.
         """
         self.logger = logging.getLogger(__name__)
         
@@ -57,6 +71,7 @@ class BacktestEngine:
         
         # Backtest state
         self.initial_balance = initial_balance
+        self.holding_days = max(1, holding_days)
         self.current_balance = initial_balance
         self.peak_balance = initial_balance
         self.daily_returns = []
@@ -64,7 +79,8 @@ class BacktestEngine:
         self.positions = {}
         self.trades = []
         self.trade_history = []
-    
+        self._current_day_index = 0
+
     def _reset_backtest_state(self) -> None:
         """Reset the backtest state."""
         self.current_balance = self.initial_balance
@@ -74,6 +90,7 @@ class BacktestEngine:
         self.positions = {}
         self.trades = []
         self.trade_history = []
+        self._current_day_index = 0
         
         # Reset component states
         self.risk_manager.reset_daily_metrics()
@@ -134,7 +151,8 @@ class BacktestEngine:
             self.logger.info(f"Backtesting {len(common_dates)} trading days")
             
             # Process each trading day
-            for date in common_dates:
+            for day_index, date in enumerate(common_dates):
+                self._current_day_index = day_index
                 self.logger.debug(f"Processing date: {date.strftime('%Y-%m-%d')}")
                 
                 # Reset daily state
@@ -183,7 +201,18 @@ class BacktestEngine:
                 # Update peak balance
                 if self.current_balance > self.peak_balance:
                     self.peak_balance = self.current_balance
-            
+
+            # Liquidate anything still open on the final day so its entry
+            # credit doesn't count as pure profit with no exit cost.
+            if self.positions and common_dates:
+                final_date = common_dates[-1]
+                self._close_positions(
+                    final_date,
+                    underlying_data.loc[final_date, 'close'],
+                    vix_analysis,
+                    force_all=True
+                )
+
             # Calculate performance metrics
             results = self._calculate_performance_metrics()
             
@@ -211,7 +240,7 @@ class BacktestEngine:
             should_trade: Whether we should trade today
         """
         # Close any existing positions (end of previous day)
-        self._close_positions(date, current_price)
+        self._close_positions(date, current_price, vix_analysis)
         
         # If we shouldn't trade today, we're done
         if not should_trade:
@@ -234,26 +263,36 @@ class BacktestEngine:
             # Simulate trade execution
             self._execute_trade(date, trade_decision, current_price)
     
-    def _close_positions(self, date: datetime, current_price: float) -> None:
+    def _close_positions(self, date: datetime, current_price: float,
+                         vix_analysis: Optional[Dict] = None,
+                         force_all: bool = False) -> None:
         """
-        Close all positions at the end of day.
+        Close positions that have reached their holding period or expiry.
 
         Args:
             date: Trading date
             current_price: Current price of the underlying
+            vix_analysis: VIX analysis for the closing day (prices exit legs)
+            force_all: Close everything regardless of age (end of backtest)
         """
         if not self.positions:
             return
 
-        self.logger.debug(f"Closing {len(self.positions)} positions on {date.strftime('%Y-%m-%d')}")
+        base_iv = (vix_analysis or {}).get('current_vix', 20.0) / 100.0
 
         for symbol, position in list(self.positions.items()):
+            if not force_all:
+                age = self._current_day_index - position.get('entry_day_index', self._current_day_index - self.holding_days)
+                expired = self._remaining_days_to_expiry(position, date) <= 0
+                if age < self.holding_days and not expired:
+                    continue
+
             strategy = position.get('strategy', 'single_option')
 
             if strategy == 'iron_condor':
-                pnl = self._close_iron_condor(position, current_price)
+                pnl = self._close_iron_condor(position, current_price, base_iv, date)
             elif strategy == 'vertical_spread':
-                pnl = self._close_vertical_spread(position, current_price)
+                pnl = self._close_vertical_spread(position, current_price, base_iv, date)
             else:
                 pnl = self._close_single_option(position, current_price)
 
@@ -269,72 +308,99 @@ class BacktestEngine:
             }
             self.trade_history.append(trade_record)
             self.logger.debug(f"Closed position {symbol} with P&L: ${pnl:.2f}")
+            del self.positions[symbol]
 
-        self.positions = {}
+    def _remaining_days_to_expiry(self, position: Dict, close_date: datetime) -> int:
+        """Days from close_date to the position's expiry (0 when at/past expiry)."""
+        expiry_str = str(position.get('expiry', ''))
+        expiry_dt = None
+        for fmt in ('%Y%m%d', '%Y-%m-%d'):
+            try:
+                expiry_dt = datetime.strptime(expiry_str, fmt)
+                break
+            except ValueError:
+                continue
+        if expiry_dt is None:
+            # Unknown expiry format: assume the shortest simulated tenor
+            return 7
+        return max(0, (expiry_dt - close_date).days)
 
-    def _close_iron_condor(self, position: Dict, current_price: float) -> float:
-        """Calculate P&L for closing an iron condor position."""
-        short_put = position['short_put_strike']
-        short_call = position['short_call_strike']
-        long_put = position['long_put_strike']
-        long_call = position['long_call_strike']
+    def _simulated_leg_price(self,
+                             underlying: float,
+                             strike: float,
+                             base_iv: float,
+                             days_to_expiry: int,
+                             option_type: str) -> float:
+        """
+        Model price of a single option leg. Must mirror the pricing in
+        _simulate_option_chain so entry and exit are marked with the same
+        model; at expiry it collapses to intrinsic value.
+        """
+        if days_to_expiry <= 0:
+            if option_type == 'call':
+                return max(0.0, underlying - strike)
+            return max(0.0, strike - underlying)
+
+        t = days_to_expiry / 365.0
+        if days_to_expiry <= 7:
+            expiry_iv_factor = 1.05
+        elif days_to_expiry <= 30:
+            expiry_iv_factor = 1.0
+        else:
+            expiry_iv_factor = 0.95
+
+        abs_moneyness = abs((strike / underlying) - 1.0)
+        smile_factor = 1.0 + abs_moneyness * 0.3
+        adjusted_iv = max(0.01, base_iv) * expiry_iv_factor * smile_factor
+
+        vol_t = adjusted_iv * math.sqrt(t)
+        d1 = math.log(underlying / strike) / vol_t + 0.5 * vol_t
+        d2 = d1 - vol_t
+
+        call_price = max(0.01, underlying * _norm_cdf(d1) - strike * _norm_cdf(d2))
+        if option_type == 'call':
+            return call_price
+        return max(0.01, call_price - underlying + strike)  # Put-call parity
+
+    def _close_iron_condor(self, position: Dict, current_price: float,
+                           base_iv: float = 0.20, close_date: Optional[datetime] = None) -> float:
+        """
+        P&L for buying back an iron condor: credit received minus the model
+        cost to close all four legs with the remaining time value. Settling at
+        intrinsic value before expiry would award weeks of unearned theta and
+        produce impossible returns.
+        """
         net_credit = position['net_credit']
         quantity = position['quantity']
-        max_width = position.get('max_width', short_call - short_put)
 
-        # Determine payout based on where price ended
-        if short_put <= current_price <= short_call:
-            # Price within short strikes - max profit (keep full credit)
-            pnl_per_spread = net_credit
-        elif current_price < long_put:
-            # Price below long put - max loss on put side
-            put_width = short_put - long_put
-            pnl_per_spread = net_credit - put_width
-        elif current_price > long_call:
-            # Price above long call - max loss on call side
-            call_width = long_call - short_call
-            pnl_per_spread = net_credit - call_width
-        elif current_price < short_put:
-            # Price between long put and short put - partial loss on put side
-            intrusion = short_put - current_price
-            pnl_per_spread = net_credit - intrusion
-        else:
-            # Price between short call and long call - partial loss on call side
-            intrusion = current_price - short_call
-            pnl_per_spread = net_credit - intrusion
+        dte = self._remaining_days_to_expiry(position, close_date) if close_date else 0
+        short_call_px = self._simulated_leg_price(current_price, position['short_call_strike'], base_iv, dte, 'call')
+        short_put_px = self._simulated_leg_price(current_price, position['short_put_strike'], base_iv, dte, 'put')
+        long_call_px = self._simulated_leg_price(current_price, position['long_call_strike'], base_iv, dte, 'call')
+        long_put_px = self._simulated_leg_price(current_price, position['long_put_strike'], base_iv, dte, 'put')
+
+        cost_to_close = (short_call_px + short_put_px) - (long_call_px + long_put_px)
+        pnl_per_spread = net_credit - cost_to_close
 
         return pnl_per_spread * quantity * 100
 
-    def _close_vertical_spread(self, position: Dict, current_price: float) -> float:
-        """Calculate P&L for closing a vertical spread position."""
-        short_strike = position['short_strike']
-        long_strike = position['long_strike']
+    def _close_vertical_spread(self, position: Dict, current_price: float,
+                               base_iv: float = 0.20, close_date: Optional[datetime] = None) -> float:
+        """
+        P&L for buying back a vertical credit spread: credit received minus
+        the model cost to close both legs with the remaining time value.
+        """
         net_credit = position['net_credit']
         quantity = position['quantity']
         spread_type = position.get('spread_type', 'bull_put')
+        option_type = 'put' if spread_type == 'bull_put' else 'call'
 
-        if spread_type == 'bull_put':
-            # Bull put spread: profit if price stays above short put
-            if current_price >= short_strike:
-                pnl_per_spread = net_credit  # Keep full credit
-            elif current_price <= long_strike:
-                width = short_strike - long_strike
-                pnl_per_spread = net_credit - width  # Max loss
-            else:
-                intrusion = short_strike - current_price
-                pnl_per_spread = net_credit - intrusion
-        elif spread_type == 'bear_call':
-            # Bear call spread: profit if price stays below short call
-            if current_price <= short_strike:
-                pnl_per_spread = net_credit  # Keep full credit
-            elif current_price >= long_strike:
-                width = long_strike - short_strike
-                pnl_per_spread = net_credit - width  # Max loss
-            else:
-                intrusion = current_price - short_strike
-                pnl_per_spread = net_credit - intrusion
-        else:
-            pnl_per_spread = net_credit * 0.5  # Fallback
+        dte = self._remaining_days_to_expiry(position, close_date) if close_date else 0
+        short_px = self._simulated_leg_price(current_price, position['short_strike'], base_iv, dte, option_type)
+        long_px = self._simulated_leg_price(current_price, position['long_strike'], base_iv, dte, option_type)
+
+        cost_to_close = short_px - long_px
+        pnl_per_spread = net_credit - cost_to_close
 
         return pnl_per_spread * quantity * 100
 
@@ -394,7 +460,7 @@ class BacktestEngine:
         if quantity <= 0 or margin_required > self.current_balance:
             return
 
-        position_id = f"{symbol}_IC_{expiry}_{short_put}P_{short_call}C"
+        position_id = f"{symbol}_IC_{expiry}_{short_put}P_{short_call}C_{date.strftime('%Y%m%d')}"
         max_width = min(short_call - short_put, long_call - short_call) if short_call > short_put else 5.0
 
         position = {
@@ -409,14 +475,15 @@ class BacktestEngine:
             'long_put_strike': long_put,
             'max_width': max_width,
             'entry_date': date,
+            'entry_day_index': self._current_day_index,
             'underlying_price': current_price
         }
 
         self.positions[position_id] = position
 
-        # Credit received (added to balance)
+        # P&L (credit minus cost to close) is booked when the position is
+        # closed; adding the credit here as well would double-count it.
         credit_received = net_credit * quantity * 100
-        self.current_balance += credit_received
 
         trade_record = {
             'date': date,
@@ -453,7 +520,7 @@ class BacktestEngine:
         if quantity <= 0 or margin_required > self.current_balance:
             return
 
-        position_id = f"{symbol}_{spread_type}_{expiry}_{short_strike}_{long_strike}"
+        position_id = f"{symbol}_{spread_type}_{expiry}_{short_strike}_{long_strike}_{date.strftime('%Y%m%d')}"
 
         position = {
             'strategy': 'vertical_spread',
@@ -465,14 +532,15 @@ class BacktestEngine:
             'short_strike': short_strike,
             'long_strike': long_strike,
             'entry_date': date,
+            'entry_day_index': self._current_day_index,
             'underlying_price': current_price
         }
 
         self.positions[position_id] = position
 
-        # Credit received
+        # P&L (credit minus cost to close) is booked when the position is
+        # closed; adding the credit here as well would double-count it.
         credit_received = net_credit * quantity * 100
-        self.current_balance += credit_received
 
         trade_record = {
             'date': date,
@@ -503,8 +571,9 @@ class BacktestEngine:
             if quantity <= 0:
                 return
 
-        self.current_balance -= cost
-        position_id = f"{symbol}_{option_type}_{expiry}_{strike}"
+        # P&L (exit minus entry) is booked when the position is closed;
+        # subtracting the cost here as well would double-charge the entry.
+        position_id = f"{symbol}_{option_type}_{expiry}_{strike}_{date.strftime('%Y%m%d')}"
 
         position = {
             'strategy': 'single_option',
@@ -515,7 +584,7 @@ class BacktestEngine:
             'quantity': quantity,
             'entry_price': price,
             'entry_date': date,
-            'cost': cost,
+            'entry_day_index': self._current_day_index,
             'underlying_price': current_price
         }
         self.positions[position_id] = position
@@ -552,8 +621,12 @@ class BacktestEngine:
         # Calculate base IV (convert VIX to decimal)
         base_iv = vix_value / 100
         
-        # Generate expiration dates (weekly options)
+        # Generate expiration dates: short-dated dailies (SPY lists daily
+        # expirations) plus weekly options out to 8 weeks
         expiry_dates = []
+        for d in (1, 2, 3):
+            expiry = date + timedelta(days=d)
+            expiry_dates.append((expiry.strftime('%Y%m%d'), d))
         for i in range(1, 9):  # Next 8 weeks
             expiry = date + timedelta(days=i*7)
             expiry_str = expiry.strftime('%Y%m%d')
@@ -601,14 +674,7 @@ class BacktestEngine:
                 # d1 approximation for Black-Scholes
                 d1 = math.log(current_price / strike) / vol_t + 0.5 * vol_t
 
-                # Standard normal CDF approximation (Abramowitz & Stegun)
-                def norm_cdf(x):
-                    a = 0.4361836
-                    b = -0.1201676
-                    c = 0.9372980
-                    k = 1.0 / (1.0 + 0.33267 * abs(x))
-                    cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * (a * k + b * k * k + c * k * k * k)
-                    return cdf if x >= 0 else 1.0 - cdf
+                norm_cdf = _norm_cdf
 
                 d2 = d1 - vol_t
 
@@ -619,8 +685,10 @@ class BacktestEngine:
                 call_price = max(0.01, round(current_price * nd1 - strike * nd2, 2))
                 put_price = max(0.01, round(call_price - current_price + strike, 2))  # Put-call parity
 
-                # Bid-ask spread (wider for far OTM)
-                spread_half = 0.04 + abs_moneyness * 0.15
+                # Bid-ask spread (wider for far OTM), calibrated to SPY's
+                # highly liquid market: ~1% half-spread near the money,
+                # ~2% a few percent out
+                spread_half = 0.01 + abs_moneyness * 0.15
                 call_bid = max(0.01, round(call_price * (1 - spread_half), 2))
                 call_ask = max(0.02, round(call_price * (1 + spread_half), 2))
                 put_bid = max(0.01, round(put_price * (1 - spread_half), 2))

@@ -20,7 +20,7 @@ class TestReturnTrendWithRisk:
     @pytest.fixture(scope="class")
     def all_risk_results(self) -> Dict[int, Dict]:
         """Pre-compute backtest results for all risk levels."""
-        mock_fetcher = RealisticMockDataFetcher()
+        mock_fetcher = RealisticMockDataFetcher(seed=20260708)
         results = {}
 
         for risk_level in range(1, 11):
@@ -45,32 +45,41 @@ class TestReturnTrendWithRisk:
 
         return results
 
-    def test_return_trend_generally_increases(self, all_risk_results):
-        """Verify returns generally trend upward with risk level."""
+    def test_exposure_scales_with_risk_level(self, all_risk_results):
+        """Verify market exposure (volatility of returns) rises with risk level.
+
+        The risk dial promises exposure scaling, not return scaling: what a
+        higher level guarantees is larger positions and wider spreads, which
+        shows up as higher equity-curve volatility. Realized return over a
+        short window is dominated by market conditions and premium-vs-friction
+        economics, so it is deliberately not asserted here.
+        """
         if len(all_risk_results) < 5:
             pytest.skip("Not enough valid backtest results")
 
-        returns = {level: res['total_return_pct'] for level, res in all_risk_results.items()}
+        risk_levels = sorted(all_risk_results.keys())
+        vols = [all_risk_results[level].get('annualized_volatility_pct', 0)
+                for level in risk_levels]
 
-        # Calculate correlation between risk level and returns
-        risk_levels = list(returns.keys())
-        return_values = [returns[level] for level in risk_levels]
+        if np.std(vols) < 0.001:
+            pytest.skip("All volatility values are the same - insufficient variance")
 
-        # Should have positive correlation (higher risk = higher expected return)
-        if len(risk_levels) >= 3:
-            # Check for variance - if all values are the same, skip
-            if np.std(return_values) < 0.001:
-                pytest.skip("All return values are the same - insufficient variance")
+        correlation = np.corrcoef(risk_levels, vols)[0, 1]
 
-            correlation = np.corrcoef(risk_levels, return_values)[0, 1]
+        if np.isnan(correlation):
+            pytest.skip("Correlation is NaN - likely due to zero variance")
 
-            # Handle NaN (can happen if all values are identical)
-            if np.isnan(correlation):
-                pytest.skip("Correlation is NaN - likely due to zero variance in returns")
+        assert correlation >= 0.3, (
+            f"Risk level should scale market exposure; corr(level, volatility) "
+            f"= {correlation:.3f}"
+        )
 
-            # Correlation should be non-negative (allowing for randomness)
-            assert correlation >= -0.3, (
-                f"Risk-return correlation {correlation:.3f} is unexpectedly negative"
+        # Returns must stay within a sane band at every level - no risk
+        # setting may produce runaway losses over six months
+        for level in risk_levels:
+            ret = all_risk_results[level]['total_return_pct']
+            assert -10.0 < ret < 100.0, (
+                f"Risk level {level} return {ret:.2f}% outside sane bounds"
             )
 
     def test_high_risk_outperforms_low_risk_on_average(self, all_risk_results):
@@ -101,7 +110,7 @@ class TestSharpeOptimalAtMedium:
     @pytest.fixture(scope="class")
     def all_risk_results(self) -> Dict[int, Dict]:
         """Pre-compute backtest results for all risk levels."""
-        mock_fetcher = RealisticMockDataFetcher()
+        mock_fetcher = RealisticMockDataFetcher(seed=20260708)
         results = {}
 
         for risk_level in range(1, 11):
@@ -235,7 +244,7 @@ class TestRiskLevelComparison:
     @pytest.fixture(scope="class")
     def all_risk_results(self) -> Dict[int, Dict]:
         """Pre-compute backtest results for all risk levels."""
-        mock_fetcher = RealisticMockDataFetcher()
+        mock_fetcher = RealisticMockDataFetcher(seed=20260708)
         results = {}
 
         for risk_level in range(1, 11):
@@ -342,7 +351,7 @@ class TestRiskRewardRelationship:
     @pytest.fixture(scope="class")
     def all_risk_results(self) -> Dict[int, Dict]:
         """Pre-compute backtest results for all risk levels."""
-        mock_fetcher = RealisticMockDataFetcher()
+        mock_fetcher = RealisticMockDataFetcher(seed=20260708)
         results = {}
 
         for risk_level in range(1, 11):
@@ -409,7 +418,7 @@ class TestEfficientFrontier:
     @pytest.fixture(scope="class")
     def all_risk_results(self) -> Dict[int, Dict]:
         """Pre-compute backtest results for all risk levels."""
-        mock_fetcher = RealisticMockDataFetcher()
+        mock_fetcher = RealisticMockDataFetcher(seed=20260708)
         results = {}
 
         for risk_level in range(1, 11):

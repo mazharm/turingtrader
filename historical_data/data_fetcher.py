@@ -18,7 +18,14 @@ except ImportError:
 
 class HistoricalDataFetcher:
     """Fetch and manage historical market data."""
-    
+
+    # Index symbols need a caret prefix on Yahoo Finance ('VIX' alone is a
+    # delisted equity ticker there and returns no data).
+    YAHOO_SYMBOL_MAP = {
+        'VIX': '^VIX',
+        'SPX': '^SPX',
+    }
+
     def __init__(self, data_dir: str = './data'):
         """
         Initialize the data fetcher.
@@ -69,11 +76,12 @@ class HistoricalDataFetcher:
             return pd.read_csv(cache_file, index_col=0, parse_dates=True)
         
         # Fetch data using yfinance with retries
+        yahoo_symbol = self.YAHOO_SYMBOL_MAP.get(symbol.upper(), symbol)
         for attempt in range(max_retries):
             try:
                 self.logger.info(f"Fetching data for {symbol} from {start_date} to {end_date} (attempt {attempt+1}/{max_retries})")
-                data = yf.download(symbol, start=start_date, end=end_date, interval=interval, progress=False)
-                
+                data = yf.download(yahoo_symbol, start=start_date, end=end_date, interval=interval, progress=False)
+
                 # Check if we got valid data
                 if data.empty:
                     self.logger.warning(f"No data found for {symbol} (attempt {attempt+1}/{max_retries})")
@@ -83,10 +91,20 @@ class HistoricalDataFetcher:
                     else:
                         # All retries failed
                         break
-                
+
+                # Newer yfinance returns MultiIndex (field, ticker) columns
+                # even for a single symbol — keep just the field names.
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+
                 # Rename columns to lowercase
                 data.columns = [c.lower() for c in data.columns]
-                
+
+                # Newer yfinance auto-adjusts prices and drops 'Adj Close';
+                # keep the column so downstream consumers find it.
+                if 'adj close' not in data.columns and 'close' in data.columns:
+                    data['adj close'] = data['close']
+
                 # Save to cache
                 data.to_csv(cache_file)
                 

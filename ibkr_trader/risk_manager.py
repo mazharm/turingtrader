@@ -6,8 +6,13 @@ Controls position sizing, risk limits, and monitors overall portfolio risk.
 import logging
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 from .config import Config, RiskParameters
+
+# Position types that represent short premium (credit) spreads: entry price is a
+# credit received, and the position profits as the cost to close falls.
+CREDIT_SPREAD_TYPES = ('iron_condor', 'vertical_spread', 'spread')
 
 
 class RiskManager:
@@ -36,7 +41,12 @@ class RiskManager:
         self.starting_balance = 0.0
         self.current_positions = {}
         self._position_history = []
-        
+
+        # Trading halt state: once halted (daily loss limit, kill switch, or
+        # repeated errors), no new positions may be opened until reset.
+        self.trading_halted = False
+        self.halt_reason = ""
+
         # Initialize risk limits
         self._initialize_risk_limits()
     
@@ -258,24 +268,132 @@ class RiskManager:
         """
         self.daily_pnl += trade_pnl
         self.daily_trades += 1
-        
-        # Check if we've exceeded max daily loss
-        if self.daily_pnl < -self.max_daily_risk_amount:
+
+        # Check if we've exceeded max daily loss; halt new trades if so.
+        if self.max_daily_risk_amount > 0 and self.daily_pnl < -self.max_daily_risk_amount:
             self.logger.warning(f"Daily risk limit exceeded: ${self.daily_pnl:.2f} loss "
                              f"exceeds ${self.max_daily_risk_amount:.2f} limit")
+            self.halt_trading(
+                f"daily loss ${-self.daily_pnl:.2f} exceeds limit ${self.max_daily_risk_amount:.2f}"
+            )
             return False
-            
+
         return True
-    
+
+    def halt_trading(self, reason: str) -> None:
+        """Halt opening of new positions until reset_daily_metrics() or resume_trading()."""
+        if not self.trading_halted:
+            self.logger.warning(f"TRADING HALTED: {reason}")
+        self.trading_halted = True
+        self.halt_reason = reason
+
+    def resume_trading(self) -> None:
+        """Clear a trading halt."""
+        if self.trading_halted:
+            self.logger.info(f"Trading resumed (was halted: {self.halt_reason})")
+        self.trading_halted = False
+        self.halt_reason = ""
+
+    def can_open_new_position(self, max_daily_trades: int = 0,
+                              proposed_risk: float = 0.0) -> Tuple[bool, str]:
+        """
+        Pre-trade gate: check every risk limit that should block a new position.
+
+        Args:
+            max_daily_trades: Maximum number of new positions per day (0 = no cap)
+            proposed_risk: Max loss (USD) of the proposed trade
+
+        Returns:
+            (allowed, reason) - reason is empty when allowed
+        """
+        if self.trading_halted:
+            return False, f"trading halted: {self.halt_reason}"
+
+        if self.max_daily_risk_amount > 0 and self.daily_pnl < -self.max_daily_risk_amount:
+            return False, (f"daily loss ${-self.daily_pnl:.2f} exceeds "
+                           f"limit ${self.max_daily_risk_amount:.2f}")
+
+        if max_daily_trades > 0 and self.daily_trades >= max_daily_trades:
+            return False, f"daily trade cap reached ({self.daily_trades}/{max_daily_trades})"
+
+        if proposed_risk > 0 and self.max_daily_risk_amount > 0:
+            # Remaining risk budget = limit - realized losses - risk already open
+            realized_loss = max(0.0, -self.daily_pnl)
+            open_risk = self.get_total_open_risk()
+            remaining = self.max_daily_risk_amount - realized_loss - open_risk
+            if proposed_risk > remaining:
+                return False, (f"proposed risk ${proposed_risk:.2f} exceeds remaining "
+                               f"daily budget ${remaining:.2f} "
+                               f"(open risk ${open_risk:.2f}, realized loss ${realized_loss:.2f})")
+
+        return True, ""
+
+    def get_total_open_risk(self) -> float:
+        """Sum of max potential loss (USD) across all open positions."""
+        total = 0.0
+        for position in self.current_positions.values():
+            entry_price = position.get('entry_price', 0.0)
+            quantity = position.get('quantity', 0)
+            if position.get('type') in CREDIT_SPREAD_TYPES:
+                risk_points = self._max_risk_points(entry_price, position.get('option_data'))
+                total += risk_points * quantity * 100
+            elif position.get('type') == 'option':
+                # Long option: max loss is the premium paid
+                total += entry_price * quantity * 100
+            else:
+                total += entry_price * quantity
+        return total
+
     def reset_daily_metrics(self) -> None:
         """Reset daily metrics for a new trading day."""
         self.logger.info(f"Resetting daily metrics. Previous P&L: ${self.daily_pnl:.2f}, "
                        f"trades: {self.daily_trades}")
-                       
+
         self.daily_pnl = 0.0
         self.daily_trades = 0
+        # A new day clears a daily-loss halt (but an explicit kill switch is
+        # re-detected by the trader every cycle, so this stays safe).
+        self.resume_trading()
     
-    def add_position(self, symbol: str, quantity: int, entry_price: float, 
+    def _max_risk_points(self, entry_credit: float, option_data: Optional[Dict]) -> float:
+        """
+        Determine max risk of a credit spread in per-share points.
+
+        Prefers strike widths from option_data; falls back to a dollar
+        max_risk_per_spread (per contract) divided by the option multiplier.
+        """
+        option_data = option_data or {}
+
+        # Iron condor: risk = narrower wing width - credit
+        try:
+            if all(k in option_data for k in ('short_call_strike', 'long_call_strike',
+                                              'short_put_strike', 'long_put_strike')):
+                call_width = float(option_data['long_call_strike']) - float(option_data['short_call_strike'])
+                put_width = float(option_data['short_put_strike']) - float(option_data['long_put_strike'])
+                width = min(call_width, put_width)
+                if width > 0:
+                    return max(0.0, width - entry_credit)
+
+            # Vertical spread: risk = width - credit
+            if 'width' in option_data and option_data['width']:
+                width = abs(float(option_data['width']))
+                if width > 0:
+                    return max(0.0, width - entry_credit)
+            if 'short_strike' in option_data and 'long_strike' in option_data:
+                width = abs(float(option_data['short_strike']) - float(option_data['long_strike']))
+                if width > 0:
+                    return max(0.0, width - entry_credit)
+        except (TypeError, ValueError):
+            pass
+
+        # Fallback: dollar risk per contract -> points
+        max_risk_dollars = option_data.get('max_risk_per_spread', 0) or 0
+        if max_risk_dollars > 0:
+            return max_risk_dollars / 100.0
+
+        return 0.0
+
+    def add_position(self, symbol: str, quantity: int, entry_price: float,
                    position_type: str = 'option', option_data: Optional[Dict] = None) -> None:
         """
         Add a new position to tracking.
@@ -305,30 +423,32 @@ class RiskManager:
             'option_data': option_data or {}
         }
 
-        # Specific handling for Iron Condors and other spreads for SL/TP
-        if position_type == 'iron_condor':
-            # For a credit spread like an Iron Condor, P&L is (entry_credit - current_cost_to_close) * quantity * 100
-            # Stop loss could be when current_cost_to_close reaches X * entry_credit (e.g., SL if debit to close is 2x credit received)
-            # Or, when underlying approaches short strikes.
-            # Target profit is when current_cost_to_close is Y% of entry_credit (e.g., TP if debit to close is 0.2 * credit received)
-            max_risk_per_spread = option_data.get('max_risk_per_spread', 0)
-            net_credit_received = entry_price # Should be positive
+        # Specific handling for credit spreads (iron condors, verticals) for SL/TP.
+        # All thresholds are expressed in per-share points (same units as quoted
+        # option/spread prices), matching entry_price and the market values
+        # passed to update_position().
+        if position_type in CREDIT_SPREAD_TYPES:
+            max_risk_points = self._max_risk_points(entry_price, option_data)
+            net_credit_received = entry_price  # Should be positive
 
-            if max_risk_per_spread > 0 and net_credit_received > 0:
-                # Stop loss: e.g., if loss reaches 50% of max possible loss beyond credit received
-                # Or, if the debit to close the position exceeds a multiple of the credit received.
-                # Example: Stop if debit to close = 2 * credit_received (loss = credit_received)
-                position['stop_loss_value'] = net_credit_received - (max_risk_per_spread * (self.risk_params.condor_stop_loss_factor_of_max_risk / 100.0))
-                # Target profit: e.g., capture 50% of the initial credit
-                position['take_profit_value'] = net_credit_received * (1 - self.risk_params.condor_profit_target_factor_of_credit / 100.0)
+            if max_risk_points > 0 and net_credit_received > 0:
+                # Stop loss: close when the debit to buy the spread back has grown
+                # to entry credit + X% of the max possible loss. P&L at that point
+                # is -X% of max risk.
+                stop_loss_factor = self.risk_params.condor_stop_loss_factor_of_max_risk / 100.0
+                position['stop_loss_value'] = net_credit_received + (max_risk_points * stop_loss_factor)
+                # Target profit: close when the spread can be bought back for
+                # (100 - Y)% of the credit, retaining Y% of it as profit.
+                profit_factor = self.risk_params.condor_profit_target_factor_of_credit / 100.0
+                position['take_profit_value'] = net_credit_received * (1 - profit_factor)
             else:
-                self.logger.warning(f"Max risk or net credit not properly defined for Iron Condor {symbol}, SL/TP may not be effective.")
+                self.logger.warning(f"Max risk or net credit not properly defined for {position_type} {symbol}, SL/TP may not be effective.")
                 position['stop_loss_value'] = None
                 position['take_profit_value'] = None
         else: # For single options or other types
             # Stop loss and take profit for long positions (buying options)
             if entry_price > 0: # Assuming long option if entry_price is positive cost
-                position['stop_loss'] = entry_price * (1 - self.stop_loss_pct/100) 
+                position['stop_loss'] = entry_price * (1 - self.stop_loss_pct/100)
                 position['take_profit'] = entry_price * (1 + self.target_profit_pct/100)
             # Add logic for short single options if applicable (negative entry_price for credit)
             
@@ -368,15 +488,14 @@ class RiskManager:
         position_type = position['type']
         
         # Calculate P&L
-        if position_type == 'iron_condor':
+        if position_type in CREDIT_SPREAD_TYPES:
             # Entry price was net credit (positive). Current market value is cost to close (debit, positive).
             # P&L = (Credit Received - Debit to Close) * Quantity * Multiplier (usually 100 for options)
-            # If current_market_value is the debit to close one spread:
-            position['pnl'] = (entry_price - current_market_value) * quantity * 100 
+            position['pnl'] = (entry_price - current_market_value) * quantity * 100
             initial_investment_basis = entry_price * quantity * 100 # The credit received
             if initial_investment_basis != 0:
                  # P&L % relative to initial credit. Can be > 100% if it becomes a large loss.
-                position['pnl_pct'] = (position['pnl'] / abs(initial_investment_basis)) * 100 
+                position['pnl_pct'] = (position['pnl'] / abs(initial_investment_basis)) * 100
             else:
                 position['pnl_pct'] = 0
         elif position_type == 'option':
@@ -397,10 +516,10 @@ class RiskManager:
             
         # Determine status based on stop loss and take profit
         status = 'open'
-        if position_type == 'iron_condor':
+        if position_type in CREDIT_SPREAD_TYPES:
             stop_loss_val = position.get('stop_loss_value')
             take_profit_val = position.get('take_profit_value')
-            # current_market_value is the debit to close. 
+            # current_market_value is the debit to close.
             # If debit_to_close >= stop_loss_val (e.g. stop_loss_val is a higher debit or smaller credit than entry)
             # If debit_to_close <= take_profit_val (e.g. take_profit_val is a smaller debit, meaning profit taken)
             if stop_loss_val is not None and current_market_value >= stop_loss_val: # Cost to close is too high
@@ -441,7 +560,7 @@ class RiskManager:
         final_pnl = 0.0
         final_pnl_pct = 0.0
 
-        if position_type == 'iron_condor':
+        if position_type in CREDIT_SPREAD_TYPES:
             # entry_price was net credit (e.g., +1.50)
             # exit_price is net debit to close (e.g., +0.30 to buy back for profit, or +2.00 to buy back for loss)
             # P&L = (Credit Received - Debit Paid) * Quantity * 100
@@ -568,28 +687,33 @@ class RiskManager:
     def should_close_for_day(self, current_time: datetime = None) -> bool:
         """
         Determine if we should close all positions for the day.
-        
+
         Args:
-            current_time: Current datetime (uses system time if None)
-            
+            current_time: Current datetime. Naive datetimes are interpreted as
+                market time (for tests/backtests); when None, the current time
+                in the configured market timezone is used.
+
         Returns:
             bool: True if we should close all positions
         """
+        market_tz = ZoneInfo(getattr(self.config.trading, 'market_timezone', 'America/New_York'))
+
         if current_time is None:
-            current_time = datetime.now()
-            
+            current_time = datetime.now(market_tz)
+        elif current_time.tzinfo is not None:
+            current_time = current_time.astimezone(market_tz)
+
         # Get configured end time offset
         end_offset_hours = self.config.trading.day_end_offset_hours
-        
-        # Determine market close time (assuming 4:00 PM Eastern)
+
+        # Determine market close time (4:00 PM in the market timezone)
         market_close = time(16, 0)
-        
+
         # Calculate cutoff time using timedelta for correct arithmetic
-        from datetime import timedelta as td
         market_close_dt = datetime.combine(current_time.date(), market_close)
-        cutoff_dt = market_close_dt - td(minutes=int(end_offset_hours * 60))
+        cutoff_dt = market_close_dt - timedelta(minutes=int(end_offset_hours * 60))
         cutoff_time = cutoff_dt.time()
-        
+
         # Check if current time is past cutoff
         return current_time.time() >= cutoff_time
 

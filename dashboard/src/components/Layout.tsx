@@ -4,6 +4,7 @@ const navItems = [
   { to: '/', label: 'Overview' },
   { to: '/equity', label: 'Equity Curves' },
   { to: '/risk', label: 'Risk Analysis' },
+  { to: '/strategies', label: 'Strategies' },
 ];
 
 export default function Layout() {

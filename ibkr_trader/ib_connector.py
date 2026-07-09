@@ -5,9 +5,11 @@ and handle order submissions, account management, and market data requests.
 """
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union, Any
+from zoneinfo import ZoneInfo
 
 # Import IB-insync for Interactive Brokers API
 try:
@@ -315,51 +317,67 @@ class IBConnector:
             
             # Sort expirations by date
             sorted_expirations = sorted(chain_data.keys())
-            
-            # Get details for specific strikes/expirations
+
+            # Batch market data requests: request everything first, wait once
+            # for the data to stream in (pumping the event loop), then read.
+            # The serial request->wait->cancel pattern took minutes per chain.
+            def _clean(value):
+                if value is None or (isinstance(value, float) and math.isnan(value)):
+                    return 0.0
+                return value
+
+            requested = []  # (expiry, right, strike, contract, ticker)
+            max_data_lines = 80  # Stay under IB's concurrent market data line limits
+
             for expiry in sorted_expirations[:5]:  # Limit to first 5 expirations
+                if len(requested) >= max_data_lines:
+                    break
                 for right in ['C', 'P']:
                     for strike in chain_data[expiry]['strikes'][::5]:  # Sample every 5th strike
-                        contract = Option(
-                            symbol, 
-                            expiry, 
-                            strike, 
-                            right, 
-                            exchange
-                        )
-                        
+                        if len(requested) >= max_data_lines:
+                            break
+                        contract = Option(symbol, expiry, strike, right, exchange)
                         try:
-                            self.ib.qualifyContracts(contract)
-                            ticker = self.ib.reqMktData(contract)
-                            time.sleep(0.1)  # Avoid rate limiting
-                            
-                            # Allow some time for data to arrive
-                            timeout = time.time() + 2
-                            while time.time() < timeout and not ticker.marketPrice():
-                                self.ib.sleep(0.1)
-                                
-                            if right == 'C':
-                                chain_data[expiry]['calls'][strike] = {
-                                    'bid': ticker.bid,
-                                    'ask': ticker.ask,
-                                    'last': ticker.last,
-                                    'volume': ticker.volume,
-                                    'iv': ticker.impliedVolatility
-                                }
-                            else:
-                                chain_data[expiry]['puts'][strike] = {
-                                    'bid': ticker.bid,
-                                    'ask': ticker.ask,
-                                    'last': ticker.last,
-                                    'volume': ticker.volume,
-                                    'iv': ticker.impliedVolatility
-                                }
-                                
-                            self.ib.cancelMktData(contract)
-                            
+                            qualified = self.ib.qualifyContracts(contract)
+                            if not qualified:
+                                continue
+                            # Generic tick 101 adds open interest
+                            ticker = self.ib.reqMktData(contract, '101', False, False)
+                            requested.append((expiry, right, strike, contract, ticker))
                         except Exception as e:
-                            self.logger.error(f"Error fetching option data for {symbol} {expiry} {strike} {right}: {e}")
-            
+                            self.logger.debug(f"Skipping {symbol} {expiry} {strike} {right}: {e}")
+
+            # Give the data time to arrive while processing network messages
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                self.ib.sleep(0.25)
+                if all(t.bid is not None or t.last is not None for *_, t in requested):
+                    break
+
+            for expiry, right, strike, contract, ticker in requested:
+                try:
+                    greeks = ticker.modelGreeks
+                    option_data = {
+                        'bid': _clean(ticker.bid),
+                        'ask': _clean(ticker.ask),
+                        'last': _clean(ticker.last),
+                        'volume': _clean(ticker.volume),
+                        'iv': _clean(ticker.impliedVolatility) or
+                              (_clean(greeks.impliedVol) if greeks else 0.0),
+                        'delta': _clean(greeks.delta) if greeks else 0.0,
+                        'open_interest': _clean(ticker.callOpenInterest if right == 'C'
+                                                else ticker.putOpenInterest),
+                    }
+                    side = 'calls' if right == 'C' else 'puts'
+                    chain_data[expiry][side][strike] = option_data
+                except Exception as e:
+                    self.logger.error(f"Error reading option data for {symbol} {expiry} {strike} {right}: {e}")
+                finally:
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except Exception:
+                        pass
+
             return chain_data
             
         except Exception as e:
@@ -436,151 +454,373 @@ class IBConnector:
     def close_all_positions(self) -> bool:
         """
         Close all open positions.
-        
+
+        Kept for backward compatibility; delegates to flatten_all_positions(),
+        which fixes the exchange on position contracts and waits for fills.
+
         Returns:
             bool: True if all positions closed successfully
         """
-        if not self.check_connection():
-            return False
-            
-        try:
-            positions = self.ib.positions()
-            
-            if not positions:
-                self.logger.info("No positions to close")
-                return True
-                
-            all_closed = True
-            
-            for position in positions:
-                contract = position.contract
-                pos_size = position.position
-                
-                if pos_size == 0:
-                    continue  # Skip zero positions
-                
-                # Determine action based on position direction
-                if pos_size > 0:
-                    action = 'SELL'
-                    quantity = abs(pos_size)
-                else:  # pos_size < 0
-                    action = 'BUY'
-                    quantity = abs(pos_size)
-                
-                # Special handling for combination/bag contracts (like iron condors)
-                if contract.secType == 'BAG':
-                    self.logger.info(f"Closing BAG position: {contract.symbol} x {quantity}")
-                    
-                    # For iron condors, use the specialized close method with retry logic
-                    if "IRON CONDOR" in contract.symbol or len(contract.comboLegs) == 4:
-                        # For iron condors that were sold (short), we need to buy them back
-                        # First, try to get a reasonable price estimate to close
-                        # Start with market data to get current price
-                        self.ib.reqMktData(contract)
-                        time.sleep(2)  # Give time for market data to arrive
-                        
-                        # Try to estimate a reasonable limit price from market data
-                        # For safety, we'll use a limit price with some buffer
-                        limit_price = None  # Default to market order if we can't get price data
-                        
-                        try:
-                            # Check if we have market data for the spread
-                            ticker = self.ib.reqMktData(contract)
-                            time.sleep(1)  # Brief pause to get data
-                            
-                            if ticker and ticker.last:
-                                # Use last price with a 10% buffer for faster execution
-                                limit_price = ticker.last * 1.1
-                                self.logger.info(f"Using estimated limit price ${limit_price:.2f} to close iron condor")
-                        except Exception as md_err:
-                            self.logger.warning(f"Error getting market data for BAG: {md_err}")
-                        
-                        # Close with improved retry logic
-                        trade = self.close_iron_condor(
-                            bag_contract=contract,
-                            quantity=quantity,
-                            limit_price=limit_price,
-                            max_attempts=3,
-                            price_increment_pct=10.0  # Be more aggressive when closing
-                        )
-                    else:
-                        # Generic BAG contract
-                        trade = self.market_order(contract, quantity, action)
-                else:
-                    # For regular contracts (stocks, single options), use market order
-                    trade = self.market_order(contract, quantity, action)
-                
-                if trade is None:
-                    all_closed = False
-                    self.logger.error(f"Failed to close position: {contract.symbol}")
-                elif trade.orderStatus.status != 'Filled':
-                    all_closed = False
-                    self.logger.warning(f"Position close order not filled: {contract.symbol}, status: {trade.orderStatus.status}")
-                else:
-                    fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus.avgFillPrice > 0 else None
-                    price_info = f"@ ${fill_price:.2f}" if fill_price else ""
-                    self.logger.info(f"Closed position: {action} {quantity} {contract.symbol} {price_info}")
-            
-            return all_closed
-            
-        except Exception as e:
-            self.logger.error(f"Error closing positions: {e}", exc_info=True)
-            return False
+        return self.flatten_all_positions()['all_closed']
     
+    @staticmethod
+    def _parse_ib_hours(hours_str: str, tz: ZoneInfo, now: datetime) -> Optional[bool]:
+        """
+        Parse an IB tradingHours/liquidHours string and report whether `now`
+        falls inside a session. Handles both IB formats:
+          old: '20090507:0700-1830,1830-2330;20090508:CLOSED'
+          new: '20180323:0400-20180323:2000;20180326:0400-20180326:2000'
+
+        Returns True/False, or None if nothing matched today's date (parse failure).
+        """
+        today_str = now.strftime('%Y%m%d')
+        found_today = False
+
+        for schedule in hours_str.split(';'):
+            schedule = schedule.strip()
+            if not schedule or not schedule.startswith(today_str):
+                continue
+            found_today = True
+
+            if schedule.endswith('CLOSED'):
+                continue
+
+            # Strip the leading 'YYYYMMDD:' then examine each comma-separated range
+            ranges = schedule[len(today_str) + 1:]
+            for time_range in ranges.split(','):
+                if '-' not in time_range:
+                    continue
+                start_str, end_str = time_range.split('-', 1)
+
+                try:
+                    # New format has full datetimes on both sides ('20180323:0400')
+                    if ':' in start_str:
+                        start_dt = datetime.strptime(start_str, '%Y%m%d:%H%M')
+                        end_dt = datetime.strptime(end_str, '%Y%m%d:%H%M')
+                    else:
+                        start_dt = datetime.strptime(f"{today_str}{start_str}", '%Y%m%d%H%M')
+                        end_dt = datetime.strptime(f"{today_str}{end_str}", '%Y%m%d%H%M')
+                except ValueError:
+                    continue
+
+                start_dt = start_dt.replace(tzinfo=tz)
+                end_dt = end_dt.replace(tzinfo=tz)
+
+                if start_dt <= now <= end_dt:
+                    return True
+
+        return False if found_today else None
+
     def is_market_open(self) -> bool:
         """
-        Check if the market is currently open.
-        
+        Check if the market is currently open (regular trading hours).
+
+        Uses IB contract details when available, falling back to a
+        US-equity-market clock check (Mon-Fri 9:30-16:00 ET) so that a
+        parsing problem cannot silently disable trading.
+
         Returns:
             bool: True if market is open
         """
-        if not self.check_connection():
+        eastern = ZoneInfo('America/New_York')
+
+        if self.check_connection():
+            try:
+                contract = Stock('SPY', 'SMART', 'USD')
+                self.ib.qualifyContracts(contract)
+
+                details_list = self.ib.reqContractDetails(contract)
+                if details_list:
+                    details = details_list[0]
+                    # Prefer liquidHours (regular session); tradingHours includes extended hours
+                    hours_str = details.liquidHours or details.tradingHours
+                    tz_id = details.timeZoneId or 'America/New_York'
+                    try:
+                        tz = ZoneInfo(tz_id)
+                    except Exception:
+                        tz = eastern
+
+                    if hours_str:
+                        now = datetime.now(tz)
+                        result = self._parse_ib_hours(hours_str, tz, now)
+                        if result is not None:
+                            return result
+                        self.logger.warning("Could not find today's session in IB hours string; "
+                                            "falling back to clock check")
+            except Exception as e:
+                self.logger.error(f"Error checking market status via IB: {e}; "
+                                  f"falling back to clock check")
+
+        # Fallback: regular US equity hours in Eastern time.
+        # NOTE: does not account for exchange holidays; the strategy simply
+        # finds no tradable market data on those days.
+        now_et = datetime.now(eastern)
+        if now_et.weekday() >= 5:  # Saturday/Sunday
             return False
-            
-        try:
-            contract = Stock('SPY', 'SMART', 'USD')
-            self.ib.qualifyContracts(contract)
-            
-            # Check market hours
-            details = self.ib.reqContractDetails(contract)[0]
-            trading_hours = details.tradingHours
-            
-            # Parse trading hours (format: 20220520:0930-1600;...)
-            if trading_hours:
-                # Get current date and time in US Eastern time
-                now = datetime.now(ib_util.datetime_to_timezone(datetime.now(), 'US/Eastern'))
-                today_str = now.strftime('%Y%m%d')
-                
-                # Look for today's hours
-                for schedule in trading_hours.split(';'):
-                    if schedule.startswith(today_str):
-                        times = schedule.split(':')[1]
-                        for time_range in times.split(','):
-                            if '-' in time_range:
-                                start_str, end_str = time_range.split('-')
-                                
-                                # Convert to datetime objects
-                                start_time = datetime.strptime(f"{today_str} {start_str}", '%Y%m%d %H%M')
-                                end_time = datetime.strptime(f"{today_str} {end_str}", '%Y%m%d %H%M')
-                                
-                                # Check if current time is within range
-                                current_time = datetime.strptime(
-                                    f"{today_str} {now.strftime('%H%M')}", 
-                                    '%Y%m%d %H%M'
-                                )
-                                
-                                if start_time <= current_time <= end_time:
-                                    return True
-            
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Error checking market status: {e}")
-            return False
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        return market_open <= now_et <= market_close
     
     def get_last_error(self) -> Optional[str]:
         """Get the last error message."""
         return self._last_error
+
+    def wait_for_fill(self, trade: Any, timeout_seconds: float) -> bool:
+        """
+        Pump the ib_insync event loop until the trade fills, terminally fails,
+        or the timeout elapses. NEVER use time.sleep() for this — it starves
+        the event loop and order status would never update.
+
+        Returns:
+            bool: True if the order is completely filled
+        """
+        if trade is None:
+            return False
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if trade.orderStatus.status == 'Filled':
+                return True
+            if trade.isDone():  # Cancelled / rejected / inactive
+                return False
+            self.ib.sleep(0.25)
+        return trade.orderStatus.status == 'Filled'
+
+    def cancel_and_wait(self, trade: Any, timeout_seconds: float = 10.0) -> int:
+        """
+        Cancel a working order and wait for the cancellation to settle, so that
+        the final filled quantity is known before any re-submission.
+
+        Returns:
+            int: Quantity filled before the cancel took effect
+        """
+        if trade is None:
+            return 0
+        try:
+            if not trade.isDone():
+                self.ib.cancelOrder(trade.order)
+                deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < deadline and not trade.isDone():
+                    self.ib.sleep(0.25)
+        except Exception as e:
+            self.logger.error(f"Error cancelling order {trade.order.orderId}: {e}")
+        return int(trade.orderStatus.filled or 0)
+
+    def execute_limit_order_with_price_walk(self,
+                                            contract: Contract,
+                                            action: str,
+                                            quantity: int,
+                                            initial_price: float,
+                                            worst_price: float,
+                                            max_attempts: int = 3,
+                                            fill_timeout_seconds: float = 15.0) -> Dict:
+        """
+        Work a limit order toward the market: submit at initial_price, and if it
+        does not fill within the timeout, cancel and re-submit the REMAINING
+        quantity at a price stepped toward worst_price. Never crosses beyond
+        worst_price. Partial fills are accounted for across attempts.
+
+        For SELL (credit) orders prices walk DOWN from initial to worst.
+        For BUY (debit) orders prices walk UP from initial to worst.
+
+        Returns:
+            Dict with:
+              filled_quantity: total contracts filled
+              avg_price: volume-weighted average fill price (0 if none)
+              complete: True if the full quantity filled
+              trades: list of ib_insync Trade objects created
+        """
+        result = {'filled_quantity': 0, 'avg_price': 0.0, 'complete': False, 'trades': []}
+
+        if not self.check_connection() or quantity <= 0:
+            return result
+
+        action = action.upper()
+        if action not in ('BUY', 'SELL'):
+            self.logger.error(f"Invalid order action: {action}")
+            return result
+
+        # Build the price ladder from initial to worst (inclusive), monotonic
+        # in the direction that improves fill probability.
+        if max_attempts < 1:
+            max_attempts = 1
+        if max_attempts == 1:
+            prices = [initial_price]
+        else:
+            step = (worst_price - initial_price) / (max_attempts - 1)
+            prices = [initial_price + step * i for i in range(max_attempts)]
+
+        remaining = quantity
+        total_value = 0.0
+        total_filled = 0
+
+        for attempt, raw_price in enumerate(prices, start=1):
+            # Options tick in cents; keep prices sane and positive
+            price = max(0.01, round(raw_price, 2))
+
+            order = LimitOrder(action, remaining, price)
+            order.tif = 'DAY'
+
+            try:
+                trade = self.ib.placeOrder(contract, order)
+            except Exception as e:
+                self.logger.error(f"Error placing order attempt {attempt}: {e}")
+                break
+
+            result['trades'].append(trade)
+            self.logger.info(f"Order attempt {attempt}/{max_attempts}: {action} {remaining} "
+                             f"{contract.symbol} @ ${price:.2f}")
+
+            filled_now = self.wait_for_fill(trade, fill_timeout_seconds)
+
+            if not filled_now:
+                filled_qty = self.cancel_and_wait(trade)
+            else:
+                filled_qty = int(trade.orderStatus.filled or 0)
+
+            if filled_qty > 0:
+                fill_price = trade.orderStatus.avgFillPrice or price
+                total_value += fill_price * filled_qty
+                total_filled += filled_qty
+                remaining -= filled_qty
+                self.logger.info(f"Attempt {attempt} filled {filled_qty} @ ${fill_price:.2f}, "
+                                 f"{remaining} remaining")
+
+            if remaining <= 0:
+                break
+
+        result['filled_quantity'] = total_filled
+        result['avg_price'] = (total_value / total_filled) if total_filled > 0 else 0.0
+        result['complete'] = remaining <= 0
+
+        if not result['complete'] and total_filled > 0:
+            self.logger.warning(f"Partial fill: {total_filled}/{quantity} contracts. "
+                                f"Position tracking must use the FILLED quantity.")
+        elif total_filled == 0:
+            self.logger.warning(f"Order not filled after {max_attempts} attempts")
+
+        return result
+
+    def get_combo_close_price(self, bag_contract: Contract,
+                              timeout_seconds: float = 5.0) -> Optional[float]:
+        """
+        Get the current cost (debit, per spread) to BUY BACK a combo position.
+        Used for monitoring credit spreads against stop-loss/profit targets.
+
+        Returns:
+            float mid/ask-based estimate, or None if no usable quote arrived
+        """
+        if not self.check_connection():
+            return None
+
+        ticker = None
+        try:
+            ticker = self.ib.reqMktData(bag_contract, '', False, False)
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                self.ib.sleep(0.25)
+                bid, ask = ticker.bid, ticker.ask
+                if bid is not None and ask is not None and not math.isnan(bid) and not math.isnan(ask) and ask > 0:
+                    return (bid + ask) / 2.0
+                last = ticker.last
+                if last is not None and not math.isnan(last) and last > 0:
+                    return last
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting combo price: {e}")
+            return None
+        finally:
+            if ticker is not None:
+                try:
+                    self.ib.cancelMktData(bag_contract)
+                except Exception:
+                    pass
+
+    def flatten_all_positions(self) -> Dict:
+        """
+        Close every open position in the account and report fill details.
+
+        Contracts returned by ib.positions() carry no exchange, so one is
+        assigned before ordering (a close order without an exchange is
+        rejected by IB).
+
+        Returns:
+            Dict with:
+              all_closed: True if every close order filled
+              closed: list of {symbol, conId, action, quantity, fill_price}
+              failed: list of {symbol, conId, reason}
+        """
+        report = {'all_closed': True, 'closed': [], 'failed': []}
+
+        if not self.check_connection():
+            report['all_closed'] = False
+            return report
+
+        try:
+            # Cancel any working orders first so they can't race our closes
+            open_trades = self.ib.openTrades()
+            for open_trade in open_trades:
+                try:
+                    self.ib.cancelOrder(open_trade.order)
+                except Exception as e:
+                    self.logger.warning(f"Could not cancel open order {open_trade.order.orderId}: {e}")
+            if open_trades:
+                self.ib.sleep(1.0)
+
+            positions = self.ib.positions()
+            if not positions:
+                self.logger.info("No positions to flatten")
+                return report
+
+            for position in positions:
+                contract = position.contract
+                pos_size = position.position
+                if pos_size == 0:
+                    continue
+
+                # Positions come back without an exchange; orders need one.
+                if not contract.exchange:
+                    contract.exchange = 'SMART'
+
+                action = 'SELL' if pos_size > 0 else 'BUY'
+                quantity = int(abs(pos_size))
+
+                self.logger.info(f"Flattening: {action} {quantity} {contract.localSymbol or contract.symbol}")
+
+                order = MarketOrder(action, quantity)
+                order.tif = 'DAY'
+                try:
+                    trade = self.ib.placeOrder(contract, order)
+                except Exception as e:
+                    report['all_closed'] = False
+                    report['failed'].append({'symbol': contract.localSymbol or contract.symbol,
+                                             'conId': contract.conId, 'reason': str(e)})
+                    continue
+
+                filled = self.wait_for_fill(trade, timeout_seconds=30.0)
+                if filled:
+                    report['closed'].append({
+                        'symbol': contract.localSymbol or contract.symbol,
+                        'conId': contract.conId,
+                        'action': action,
+                        'quantity': quantity,
+                        'fill_price': trade.orderStatus.avgFillPrice or 0.0,
+                    })
+                else:
+                    report['all_closed'] = False
+                    report['failed'].append({
+                        'symbol': contract.localSymbol or contract.symbol,
+                        'conId': contract.conId,
+                        'reason': f"close order status: {trade.orderStatus.status}",
+                    })
+                    self.logger.error(f"POSITION NOT CLOSED: {contract.localSymbol or contract.symbol} "
+                                      f"status={trade.orderStatus.status} — manual intervention may be required")
+
+            return report
+
+        except Exception as e:
+            self.logger.error(f"Error flattening positions: {e}", exc_info=True)
+            report['all_closed'] = False
+            return report
         
     def create_iron_condor_contract(self,
                               symbol: str,
@@ -658,7 +898,15 @@ class IBConnector:
         
         # Qualify contracts to get contract IDs
         self.ib.qualifyContracts(long_put, short_put, short_call, long_call)
-        
+
+        # An unqualified leg would produce a conId of 0 and the whole combo
+        # order would be rejected; fail fast instead.
+        for leg_name, leg_contract in [('long put', long_put), ('short put', short_put),
+                                       ('short call', short_call), ('long call', long_call)]:
+            if not leg_contract.conId:
+                raise ValueError(f"Could not qualify {leg_name} leg "
+                                 f"({symbol} {expiry} {leg_contract.strike} {leg_contract.right})")
+
         # Update combo legs with contract IDs
         legs[0].conId = long_put.conId
         legs[1].conId = short_put.conId
@@ -788,6 +1036,7 @@ class IBConnector:
                                long_call_strike: float,
                                quantity: int,
                                limit_price: Optional[float] = None, # This is the NET CREDIT desired
+                               action: str = 'SELL', # 'SELL' opens the condor for a credit
                                exchange: str = 'SMART', # Default to SMART for underlying, options might use specific exchanges
                                currency: str = 'USD') -> Any:
         """
@@ -828,20 +1077,24 @@ class IBConnector:
             # Qualify the bag contract itself
             self.ib.qualifyContracts(bag_contract)
 
+            order_action = action.upper()
+            if order_action not in ('SELL', 'BUY'):
+                self.logger.error(f"Invalid iron condor action: {action}")
+                return None
+
             # Create order: To receive a credit, this must be a SELL order.
             # The limit_price should be the positive credit amount.
             if limit_price is not None:
                 if limit_price <= 0:
                     self.logger.warning("Limit price for credit must be positive. Using abs(limit_price).")
-                order_action = 'SELL' # Selling the condor to receive credit
                 lmt_price = abs(limit_price) # IB expects positive price for limit orders
                 order = LimitOrder(order_action, quantity, lmt_price)
-                order.tif = 'GTC' # Good Till Cancelled, or consider 'DAY'
+                order.tif = 'DAY'  # This is an intraday strategy; never leave GTC orders behind
             else:
                 # Market orders for complex spreads are generally not recommended due to slippage.
                 # Consider raising an error or requiring a limit price.
                 self.logger.warning("Submitting Iron Condor as a Market Order. This is risky.")
-                order = MarketOrder('SELL', quantity) # Still SELL to establish the credit position
+                order = MarketOrder(order_action, quantity)
                 
             # Submit order
             trade = self.ib.placeOrder(bag_contract, order) # Use placeOrder directly
@@ -868,6 +1121,58 @@ class IBConnector:
             self.logger.error(f"Error submitting iron condor order: {e}", exc_info=True)
             return None
             
+    def create_vertical_spread_contract(self,
+                            symbol: str,
+                            expiry: str,
+                            short_strike: float,
+                            long_strike: float,
+                            right: str,  # 'C' for call, 'P' for put
+                            exchange: str = 'SMART',
+                            currency: str = 'USD') -> Optional[Contract]:
+        """
+        Create and qualify a two-leg vertical spread BAG contract
+        (leg 0 = short/SELL, leg 1 = long/BUY).
+
+        Returns:
+            Qualified Bag contract, or None if the legs could not be qualified
+        """
+        # Validate spread geometry
+        if right == 'C':
+            if long_strike <= short_strike:
+                self.logger.error("Bear call spread requires long_strike > short_strike")
+                return None
+        elif right == 'P':
+            if short_strike <= long_strike:
+                self.logger.error("Bull put spread requires short_strike > long_strike")
+                return None
+        else:
+            self.logger.error(f"Invalid option type: {right}, must be 'C' or 'P'")
+            return None
+
+        short_contract = Option(symbol, expiry, short_strike, right, exchange)
+        long_contract = Option(symbol, expiry, long_strike, right, exchange)
+        self.ib.qualifyContracts(short_contract, long_contract)
+
+        if not short_contract.conId or not long_contract.conId:
+            self.logger.error(f"Could not qualify vertical spread legs "
+                              f"({symbol} {expiry} {short_strike}/{long_strike} {right})")
+            return None
+
+        legs = [
+            ComboLeg(conId=short_contract.conId, ratio=1, action='SELL',
+                     exchange=exchange, openClose=0, designatedLocation='', exemptCode=-1),
+            ComboLeg(conId=long_contract.conId, ratio=1, action='BUY',
+                     exchange=exchange, openClose=0, designatedLocation='', exemptCode=-1),
+        ]
+
+        bag_contract = Contract()
+        bag_contract.symbol = symbol
+        bag_contract.secType = 'BAG'
+        bag_contract.currency = currency
+        bag_contract.exchange = exchange
+        bag_contract.comboLegs = legs
+        return bag_contract
+
     def submit_vertical_spread_order(self,
                             symbol: str,
                             expiry: str,
@@ -899,103 +1204,22 @@ class IBConnector:
         """
         if not self.check_connection():
             return None
-            
+
         try:
-            # Create spread contract
-            bag_contract = Contract()
-            bag_contract.symbol = symbol
-            bag_contract.secType = 'BAG'
-            bag_contract.currency = currency
-            bag_contract.exchange = exchange
-            
-            # Create combo legs based on spread type
-            legs = []
-            
-            # Determine spread configuration based on option type and strikes
-            if right == 'C':  # Call spread
-                if long_strike > short_strike:  # Bear Call Spread (short lower strike, long higher strike)
-                    # Short leg (sell call)
-                    legs.append(ComboLeg(
-                        conId=0,  # Will be filled in by IB
-                        ratio=1,
-                        action='SELL',
-                        exchange=exchange,
-                        openClose=0,  # 0 for open
-                        designatedLocation='',
-                        exemptCode=-1
-                    ))
-                    
-                    # Long leg (buy call)
-                    legs.append(ComboLeg(
-                        conId=0,  # Will be filled in by IB
-                        ratio=1,
-                        action='BUY',
-                        exchange=exchange,
-                        openClose=0,  # 0 for open
-                        designatedLocation='',
-                        exemptCode=-1
-                    ))
-                else:
-                    self.logger.error("Invalid call spread configuration: long_strike must be greater than short_strike for bear call spread")
-                    return None
-                    
-            elif right == 'P':  # Put spread
-                if short_strike > long_strike:  # Bull Put Spread (short higher strike, long lower strike)
-                    # Short leg (sell put)
-                    legs.append(ComboLeg(
-                        conId=0,  # Will be filled in by IB
-                        ratio=1,
-                        action='SELL',
-                        exchange=exchange,
-                        openClose=0,  # 0 for open
-                        designatedLocation='',
-                        exemptCode=-1
-                    ))
-                    
-                    # Long leg (buy put)
-                    legs.append(ComboLeg(
-                        conId=0,  # Will be filled in by IB
-                        ratio=1,
-                        action='BUY',
-                        exchange=exchange,
-                        openClose=0,  # 0 for open
-                        designatedLocation='',
-                        exemptCode=-1
-                    ))
-                else:
-                    self.logger.error("Invalid put spread configuration: short_strike must be greater than long_strike for bull put spread")
-                    return None
-            else:
-                self.logger.error(f"Invalid option type: {right}, must be 'C' or 'P'")
+            # Create and qualify the spread contract
+            bag_contract = self.create_vertical_spread_contract(
+                symbol, expiry, short_strike, long_strike, right, exchange, currency
+            )
+            if bag_contract is None:
                 return None
-                
-            # Create option contracts for each leg
-            if right == 'C':
-                # For bear call spread
-                short_contract = Option(symbol, expiry, short_strike, right, exchange, tradingClass=symbol)
-                long_contract = Option(symbol, expiry, long_strike, right, exchange, tradingClass=symbol)
-            else:
-                # For bull put spread
-                short_contract = Option(symbol, expiry, short_strike, right, exchange, tradingClass=symbol)
-                long_contract = Option(symbol, expiry, long_strike, right, exchange, tradingClass=symbol)
-                
-            # Qualify the contracts to get the conId
-            self.ib.qualifyContracts(short_contract, long_contract)
-            
-            # Set conIds in combo legs
-            legs[0].conId = short_contract.conId
-            legs[1].conId = long_contract.conId
-            
-            # Set legs in bag contract
-            bag_contract.comboLegs = legs
-            
+
             # Create order
             if limit_price is not None:
                 if limit_price <= 0 and action == 'SELL':
                     self.logger.warning("Limit price for credit spread must be positive")
                     limit_price = abs(limit_price)
                 order = LimitOrder(action, quantity, limit_price)
-                order.tif = 'GTC'  # Good Till Cancelled
+                order.tif = 'DAY'  # Intraday strategy; never leave GTC orders behind
             else:
                 self.logger.warning("Submitting vertical spread as Market Order (risky)")
                 order = MarketOrder(action, quantity)

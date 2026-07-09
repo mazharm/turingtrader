@@ -24,6 +24,7 @@ export interface SummaryData {
   end_date: string;
   initial_investment: number;
   period_days: number;
+  data_source?: string;
   optimal_risk_level: number;
   best_return_risk_level: number;
   risk_levels: RiskLevelSummary[];
@@ -74,4 +75,46 @@ export interface RiskLevelData {
   metrics: RiskLevelMetrics;
   daily_values: DailyValue[];
   risk_parameters: RiskParameters;
+}
+
+export interface StrategyParams {
+  min_dte: number;
+  max_dte: number;
+  holding_days: number;
+}
+
+export interface StrategyRiskLevelSummary {
+  risk_level: number;
+  total_return_pct: number;
+  annualized_return_pct: number;
+  annualized_volatility_pct: number;
+  max_drawdown_pct: number;
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  win_rate: number;
+  profit_factor: number;
+  total_trades: number;
+  final_balance: number;
+}
+
+export interface StrategySummary {
+  slug: string;
+  name: string;
+  description: string;
+  params: StrategyParams;
+  best_sharpe_level: number | null;
+  risk_levels: StrategyRiskLevelSummary[];
+}
+
+export interface StrategiesIndex {
+  generated_at: string;
+  start_date: string;
+  end_date: string;
+  initial_investment: number;
+  data_source?: string;
+  strategies: StrategySummary[];
+}
+
+export interface StrategyDetail extends StrategySummary {
+  daily_values_by_level: Record<string, DailyValue[]>;
 }

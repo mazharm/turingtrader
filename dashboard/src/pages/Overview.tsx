@@ -47,6 +47,16 @@ export default function Overview() {
       <h2>Algorithm Evaluation</h2>
       <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: 20, marginTop: -12 }}>
         {summary.start_date} to {summary.end_date} &middot; ${summary.initial_investment.toLocaleString()} initial
+        {summary.data_source && (
+          <>
+            {' '}&middot;{' '}
+            <span style={summary.data_source.includes('simulated') || summary.data_source === 'unknown'
+              ? { color: '#ffd740', fontWeight: 600 }
+              : undefined}>
+              {summary.data_source}
+            </span>
+          </>
+        )}
       </div>
 
       <div className="card-grid">

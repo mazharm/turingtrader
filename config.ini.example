@@ -26,6 +26,20 @@ day_start_offset_hours = 0.5
 # Stop trading this many hours before market close
 day_end_offset_hours = 0.5
 default_order_type = MKT
+# Exchange clock used for all market-hours decisions (IANA timezone name)
+market_timezone = America/New_York
+
+# --- Live-trading safety limits ---
+# Maximum number of new positions opened per day
+max_daily_trades = 5
+# Halt trading after this many consecutive trading-cycle errors
+max_consecutive_errors = 5
+# If a file with this name exists, all positions are flattened and trading halts
+kill_switch_file = KILL_SWITCH
+# Seconds to let a working limit order rest before repricing
+order_fill_timeout_seconds = 15
+# Number of limit-price improvements before giving up on an entry
+order_max_attempts = 3
 
 [PostgreSQL]
 # PostgreSQL/TimescaleDB connection settings

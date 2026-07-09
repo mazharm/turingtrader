@@ -84,7 +84,14 @@ def parse_arguments():
         default='INFO',
         help='Logging level'
     )
-    
+
+    # Safety: live trading must be explicitly confirmed
+    parser.add_argument(
+        '--confirm-live',
+        action='store_true',
+        help='Required together with --mode live to trade real money'
+    )
+
     return parser.parse_args()
 
 
@@ -101,9 +108,19 @@ def run_trader(args):
         create_default_config_file(config_path)
         print(f"Created default configuration file: {config_path}")
         return 0
-    
+
+    # Live trading requires explicit confirmation; default is paper trading.
+    if args.mode == 'live' and not args.confirm_live:
+        logging.error("Refusing to start LIVE trading without --confirm-live. "
+                      "Use '--mode paper' to trade against a paper account.")
+        return 1
+
     # Initialize the trader
     trader = TuringTrader(args.config)
+
+    if args.mode == 'live':
+        logging.warning("LIVE trading mode: real orders will be submitted "
+                        f"(IB port {trader.config.ibkr.port})")
     
     # Set risk level if provided
     if args.risk_level is not None:

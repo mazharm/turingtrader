@@ -7,29 +7,58 @@ import numpy as np
 from datetime import datetime, timedelta
 import logging
 import os
+import zlib
 
 
 class RealisticMockDataFetcher:
     """Mock data fetcher that generates realistic market data for backtesting."""
-    
-    def __init__(self, data_dir: str = './data'):
+
+    def __init__(self, data_dir: str = './data', seed: int = None):
         """
         Initialize the realistic mock data fetcher.
-        
+
         Args:
             data_dir: Directory for storing cached data (not used in mock)
+            seed: Optional random seed. When set, generated data is a pure
+                function of (seed, symbol, start_date, end_date), so repeated
+                requests — e.g. backtests at different risk levels — see the
+                identical simulated market instead of fresh random draws.
         """
         self.data_dir = data_dir
         self.logger = logging.getLogger(__name__)
-        
+        self.seed = seed
+
         # Create data directory if it doesn't exist
         os.makedirs(data_dir, exist_ok=True)
-        
+
         # Properties for enhanced backtesting
         self.iv_hv_ratio_min = 1.2  # Minimum IV/HV ratio for backtesting
         self.iv_hv_ratio_max = 2.5  # Maximum IV/HV ratio for backtesting
         self.base_vix_level = 25.0  # Base VIX level for more realistic volatility
-    
+
+    def _rng_for(self, *parts) -> np.random.RandomState:
+        """
+        Return a RandomState for a generation request.
+
+        Seeded instances derive it from (seed, *parts) so the same request
+        always yields the same data; unseeded instances keep the legacy
+        behavior of drawing from the global RNG state.
+        """
+        if self.seed is None:
+            return np.random  # module has the same draw API as a RandomState
+        key = '|'.join([str(self.seed)] + [str(p) for p in parts])
+        return np.random.RandomState(zlib.crc32(key.encode()) & 0xFFFFFFFF)
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """Map symbol aliases to one canonical name so 'VIX' and '^VIX' match."""
+        sym = symbol.upper()
+        if sym in ('SPY', '^SPX', 'SPX'):
+            return 'SPY'
+        if sym in ('VIX', '^VIX'):
+            return 'VIX'
+        return sym
+
     def fetch_data(self, 
                  symbol: str, 
                  start_date,
@@ -55,18 +84,25 @@ class RealisticMockDataFetcher:
         if isinstance(end_date, str):
             end_date = pd.to_datetime(end_date)
             
-        # Check for cached data if use_cache is enabled
-        cache_file = os.path.join(self.data_dir, f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}_realistic_mock.csv")
-        
+        canonical = self._normalize_symbol(symbol)
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+
+        # Check for cached data if use_cache is enabled. Seeded fetchers use a
+        # seed-specific cache name so they never load data from unseeded runs.
+        seed_tag = '' if self.seed is None else f"_seed{self.seed}"
+        cache_file = os.path.join(self.data_dir, f"{canonical}_{start_str}_{end_str}{seed_tag}_realistic_mock.csv")
+
         if use_cache and os.path.exists(cache_file):
             self.logger.info(f"Loading cached realistic mock data for {symbol} from {cache_file}")
             return pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        
-        # Generate realistic data
-        if symbol.upper() in ['SPY', '^SPX', 'SPX']:
-            data = self._generate_realistic_spy_data(start_date, end_date)
-        elif symbol.upper() in ['VIX', '^VIX']:
-            data = self._generate_realistic_vix_data(start_date, end_date)
+
+        # Generate realistic data with a request-specific RNG
+        rng = self._rng_for(canonical, start_str, end_str)
+        if canonical == 'SPY':
+            data = self._generate_realistic_spy_data(start_date, end_date, rng)
+        elif canonical == 'VIX':
+            data = self._generate_realistic_vix_data(start_date, end_date, rng)
         else:
             # Return empty dataframe for unknown symbols
             self.logger.warning(f"No mock data available for symbol: {symbol}")
@@ -78,17 +114,19 @@ class RealisticMockDataFetcher:
         
         return data
     
-    def _generate_realistic_spy_data(self, start_date, end_date) -> pd.DataFrame:
+    def _generate_realistic_spy_data(self, start_date, end_date, rng=None) -> pd.DataFrame:
         """
         Generate realistic SPY data with price movements that mimic actual stock market behavior.
-        
+
         Args:
             start_date: Start date
             end_date: End date
-            
+            rng: RandomState to draw from (global np.random if omitted)
+
         Returns:
             DataFrame with mock SPY data
         """
+        rng = rng if rng is not None else np.random
         # Generate date range of business days
         date_range = pd.date_range(start=start_date, end=end_date, freq='B')  # Business days
         
@@ -106,11 +144,11 @@ class RealisticMockDataFetcher:
         
         # Generate daily returns with slight upward bias and occasional larger movements
         num_days = len(date_range)
-        random_factor = np.random.normal(daily_drift, daily_volatility, num_days)
-        
+        random_factor = rng.normal(daily_drift, daily_volatility, num_days)
+
         # Add some occasional jumps (big up or down days)
         for i in range(num_days // 20):  # Every ~20 trading days
-            jump_idx = np.random.randint(0, num_days)
+            jump_idx = rng.randint(0, num_days)
             random_factor[jump_idx] = random_factor[jump_idx] * 3
         
         # Calculate cumulative returns
@@ -118,12 +156,12 @@ class RealisticMockDataFetcher:
         prices = start_price * cumulative_returns
         
         # Add price data with typical open/high/low/close relationships
-        df['open'] = prices * (1 + np.random.normal(0, 0.002, num_days))
+        df['open'] = prices * (1 + rng.normal(0, 0.002, num_days))
         # High is higher than both open and close
         df['close'] = prices
-        df['high'] = np.maximum(df['open'], df['close']) * (1 + np.abs(np.random.normal(0.001, 0.003, num_days)))
+        df['high'] = np.maximum(df['open'], df['close']) * (1 + np.abs(rng.normal(0.001, 0.003, num_days)))
         # Low is lower than both open and close
-        df['low'] = np.minimum(df['open'], df['close']) * (1 - np.abs(np.random.normal(0.001, 0.003, num_days)))
+        df['low'] = np.minimum(df['open'], df['close']) * (1 - np.abs(rng.normal(0.001, 0.003, num_days)))
         
         # Add volume with higher volume on bigger price movement days
         base_volume = 50000000  # SPY average volume
@@ -136,17 +174,19 @@ class RealisticMockDataFetcher:
         
         return df
     
-    def _generate_realistic_vix_data(self, start_date, end_date) -> pd.DataFrame:
+    def _generate_realistic_vix_data(self, start_date, end_date, rng=None) -> pd.DataFrame:
         """
         Generate realistic VIX data with mean-reverting behavior and occasional spikes.
-        
+
         Args:
             start_date: Start date
             end_date: End date
-            
+            rng: RandomState to draw from (global np.random if omitted)
+
         Returns:
             DataFrame with mock VIX data
         """
+        rng = rng if rng is not None else np.random
         # Generate date range
         date_range = pd.date_range(start=start_date, end=end_date, freq='B')  # Business days
         
@@ -171,7 +211,7 @@ class RealisticMockDataFetcher:
             mean_reversion = reversion_strength * (mean_level - vix_levels[i-1])
             
             # Random component
-            random_shock = np.random.normal(0, daily_volatility * vix_levels[i-1])
+            random_shock = rng.normal(0, daily_volatility * vix_levels[i-1])
             
             # Next value
             vix_levels[i] = vix_levels[i-1] + mean_reversion + random_shock
@@ -181,8 +221,8 @@ class RealisticMockDataFetcher:
         
         # Add occasional volatility spikes (market panic events)
         for i in range(num_days // 30):  # More frequent spikes (every ~30 days)
-            spike_idx = np.random.randint(0, num_days)
-            spike_magnitude = np.random.uniform(1.5, 2.5)  # 50-150% increase
+            spike_idx = rng.randint(0, num_days)
+            spike_magnitude = rng.uniform(1.5, 2.5)  # 50-150% increase
             vix_levels[spike_idx] = vix_levels[spike_idx] * spike_magnitude
             
             # Usually spikes are followed by a gradual decrease
@@ -200,11 +240,11 @@ class RealisticMockDataFetcher:
         
         # Add some intraday noise to create high and low
         daily_range_factor = 0.03  # 3% intraday range on average
-        df['high'] = df['close'] * (1 + np.random.uniform(0, daily_range_factor, num_days))
-        df['low'] = df['close'] * (1 - np.random.uniform(0, daily_range_factor, num_days))
-        
+        df['high'] = df['close'] * (1 + rng.uniform(0, daily_range_factor, num_days))
+        df['low'] = df['close'] * (1 - rng.uniform(0, daily_range_factor, num_days))
+
         # Volume is less relevant for VIX, but add it for consistency
-        df['volume'] = np.random.randint(1000000, 5000000, num_days)
+        df['volume'] = rng.randint(1000000, 5000000, num_days)
         
         # Add adjusted close (same as close for indices)
         df['adj close'] = df['close']
@@ -302,7 +342,11 @@ class RealisticMockDataFetcher:
             
         # Create option chain dictionary
         option_chain = {}
-        
+
+        # Request-specific RNG so seeded fetchers return identical chains
+        # (volume/open interest) for the same symbol and date.
+        chain_rng = self._rng_for('chain', self._normalize_symbol(symbol), date.strftime('%Y-%m-%d'))
+
         for exp_date in expirations:
             exp_datetime = pd.to_datetime(exp_date)
             days_to_expiry = (exp_datetime - date).days
@@ -359,8 +403,8 @@ class RealisticMockDataFetcher:
                     'bid': round(bid, 2),
                     'ask': round(ask, 2),
                     'last': round((bid + ask) / 2, 2),
-                    'volume': int(np.random.randint(10, 1000) * (1.5 - abs(moneyness))),
-                    'open_interest': int(np.random.randint(100, 5000) * (1.5 - abs(moneyness))),
+                    'volume': int(chain_rng.randint(10, 1000) * (1.5 - abs(moneyness))),
+                    'open_interest': int(chain_rng.randint(100, 5000) * (1.5 - abs(moneyness))),
                     'delta': round(delta, 3),
                     'gamma': round(gamma, 4),
                     'theta': round(theta, 3),
@@ -403,8 +447,8 @@ class RealisticMockDataFetcher:
                     'bid': round(bid, 2),
                     'ask': round(ask, 2),
                     'last': round((bid + ask) / 2, 2),
-                    'volume': int(np.random.randint(10, 1000) * (1.5 - abs(moneyness))),
-                    'open_interest': int(np.random.randint(100, 5000) * (1.5 - abs(moneyness))),
+                    'volume': int(chain_rng.randint(10, 1000) * (1.5 - abs(moneyness))),
+                    'open_interest': int(chain_rng.randint(100, 5000) * (1.5 - abs(moneyness))),
                     'delta': round(delta, 3),
                     'gamma': round(gamma, 4),
                     'theta': round(theta, 3),
@@ -455,6 +499,8 @@ class RealisticMockDataFetcher:
         Returns:
             Float IV/HV ratio
         """
-        # Generate a realistic but elevated IV/HV ratio for testing
-        # Randomly generate between the min and max values set in the constructor
-        return np.random.uniform(self.iv_hv_ratio_min, self.iv_hv_ratio_max)
+        # Generate a realistic but elevated IV/HV ratio for testing.
+        # Seeded fetchers give the same ratio for the same (symbol, date, expiry)
+        # so repeated backtests see identical entry signals.
+        rng = self._rng_for('iv_hv', self._normalize_symbol(symbol), date, expiry)
+        return rng.uniform(self.iv_hv_ratio_min, self.iv_hv_ratio_max)

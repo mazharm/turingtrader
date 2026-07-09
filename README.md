@@ -30,11 +30,39 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Live Trading
+### Paper Trading (default, recommended first)
 
 ```bash
-python main.py --mode live
+python main.py --mode paper
 ```
+
+### Live Trading
+
+Live mode submits real orders and must be explicitly confirmed:
+
+```bash
+python main.py --mode live --confirm-live
+```
+
+### Live-Trading Safety Controls
+
+The trading loop enforces these safeguards on every cycle:
+
+- **Kill switch**: create a file named `KILL_SWITCH` (configurable) in the
+  working directory and the trader immediately flattens all positions and
+  halts. Delete the file and restart to resume.
+- **Daily loss limit**: when realized losses reach the configured
+  `max_daily_risk_pct` of account value, trading halts for the day.
+- **Daily trade cap**: at most `max_daily_trades` new positions per day.
+- **Position monitoring**: open spreads are marked to market every cycle and
+  closed automatically at their stop-loss or profit target.
+- **End-of-day flatten**: all positions are closed before the configured
+  close-out window; nothing is held overnight.
+- **Error circuit breaker**: after `max_consecutive_errors` failed cycles the
+  trader flattens everything and halts.
+- **Connection watchdog**: IB disconnects trigger automatic reconnection with
+  exponential backoff.
+- **Graceful shutdown**: Ctrl+C / SIGTERM flattens all positions before exit.
 
 ### Backtesting
 

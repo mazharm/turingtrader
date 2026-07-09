@@ -45,6 +45,13 @@ def get_risk_parameters(level: int) -> dict:
     }
 
 
+def describe_data_source(data_fetcher) -> str:
+    """Human-readable label for where the backtest data came from."""
+    if isinstance(data_fetcher, HistoricalDataFetcher):
+        return "real historical data (Yahoo Finance)"
+    return "simulated data (realistic mock)"
+
+
 def serialize_daily_values(daily_values: list) -> list:
     """Convert daily_values to JSON-serializable format."""
     result = []
@@ -84,6 +91,8 @@ def run_backtests(args) -> dict:
             logging.warning(f"Yahoo Finance unavailable ({e}), falling back to realistic mock data")
             data_fetcher = RealisticMockDataFetcher()
 
+    data_source = describe_data_source(data_fetcher)
+
     engine = BacktestEngine(
         config=config,
         initial_balance=args.initial_investment,
@@ -106,10 +115,11 @@ def run_backtests(args) -> dict:
         enriched = analyzer.analyze_results(raw, risk_level=level)
         results_by_risk[level] = enriched
 
-    return results_by_risk, start_date, end_date
+    return results_by_risk, start_date, end_date, data_source
 
 
-def build_summary(results_by_risk: dict, initial_investment: float, start_date: str, end_date: str) -> dict:
+def build_summary(results_by_risk: dict, initial_investment: float, start_date: str, end_date: str,
+                  data_source: str = None) -> dict:
     """Build summary.json content."""
     analyzer = PerformanceAnalyzer()
     comparison = analyzer.compare_risk_levels(results_by_risk)
@@ -143,6 +153,7 @@ def build_summary(results_by_risk: dict, initial_investment: float, start_date: 
         "end_date": end_date,
         "initial_investment": initial_investment,
         "period_days": (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days,
+        "data_source": data_source or "unknown",
         "optimal_risk_level": comparison.get("optimal_risk_level"),
         "best_return_risk_level": comparison.get("best_return_risk_level"),
         "risk_levels": risk_levels,
@@ -200,14 +211,14 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Run backtests
-    results_by_risk, start_date, end_date = run_backtests(args)
+    results_by_risk, start_date, end_date, data_source = run_backtests(args)
 
     if not results_by_risk:
         logging.error("No backtest results generated")
         return 1
 
     # Write summary.json
-    summary = build_summary(results_by_risk, args.initial_investment, start_date, end_date)
+    summary = build_summary(results_by_risk, args.initial_investment, start_date, end_date, data_source)
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
